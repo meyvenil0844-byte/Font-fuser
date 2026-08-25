@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html>
+<body>
+<script type="module">
+  import opentype from 'https://cdn.jsdelivr.net/npm/opentype.js@1.3.4/+esm';
+  const notdef = new opentype.Glyph({ name: '.notdef', unicode: 0, advanceWidth: 1000, path: new opentype.Path() });
+  const newPath = new opentype.Path();
+  newPath.moveTo(10, 10);
+  newPath.lineTo(100, 100);
+  newPath.close();
+  
+  const glyphs = [notdef, new opentype.Glyph({
+    name: 'uni0041',
+    unicode: 0x41,
+    advanceWidth: 800,
+    path: newPath
+  })];
+  
+  const font = new opentype.Font({
+    familyName: "test",
+    styleName: 'Regular',
+    unitsPerEm: 1000,
+    ascender: 800,
+    descender: -200,
+    glyphs: glyphs,
+    outlinesFormat: 'truetype'
+  });
+  const buffer = font.toArrayBuffer();
+  console.log("Buffer created:", buffer.byteLength);
+  try {
+    const fontFace = new FontFace('test', buffer);
+    await fontFace.load();
+    console.log("Font loaded!");
+    document.body.innerHTML += 'Loaded!';
+  } catch (e) {
+    console.error("Failed to load:", e);
+    document.body.innerHTML += 'Failed: ' + e.message;
+  }
+</script>
+</body>
+</html>

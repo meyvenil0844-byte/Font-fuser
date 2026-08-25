@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html>
+<body>
+<script type="module">
+  import opentype from 'https://cdn.jsdelivr.net/npm/opentype.js@1.3.4/dist/opentype.module.js';
+  async function run() {
+    try {
+      const notdef = new opentype.Glyph({ name: '.notdef', unicode: undefined, advanceWidth: 1000, path: new opentype.Path() });
+      const font = new opentype.Font({
+        familyName: "TracedFont",
+        styleName: 'Regular',
+        unitsPerEm: 1000,
+        ascender: 800,
+        descender: -200,
+        glyphs: [notdef],
+      });
+      const buffer = font.toArrayBuffer();
+      const fontFace = new FontFace(`Test`, buffer);
+      await fontFace.load();
+      document.body.innerHTML = 'SUCCESS';
+    } catch(e) {
+      document.body.innerHTML = 'ERROR: ' + e.message;
+    }
+  }
+  run();
+</script>
+</body>
+</html>

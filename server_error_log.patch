@@ -1,0 +1,12 @@
+--- src/App.tsx
++++ src/App.tsx
+@@ -95,7 +95,8 @@
+       console.error(err);
+       let msg = err.message || String(err);
+       if (msg.includes('<html')) msg = 'Server returned an HTML error page. The request might be too large.';
+-      alert(`Failed to generate font: ${msg}`);
++      fetch('/api/health?error=' + encodeURIComponent(err.stack || msg));
++      alert(`Failed to generate font: ${msg}\n\nPlease check the backend logs!`);
+     } finally {
+       setIsGenerating(false);
+       setProgressMsg('');

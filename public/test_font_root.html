@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html>
+<body>
+<script type="module">
+  import opentype from '/node_modules/opentype.js/dist/opentype.module.js';
+  
+  async function run() {
+    try {
+      const cps = []; // EMPTY FONT TEST
+      
+      const notdef = new opentype.Glyph({ name: '.notdef', unicode: undefined, advanceWidth: 1000, path: new opentype.Path() });
+      
+      const glyphs = [notdef];
+      for (const cp of cps) {
+        glyphs.push(new opentype.Glyph({
+          name: cp === 0 ? '.null' : ('uni' + cp.toString(16).toUpperCase()),
+          unicode: cp,
+          advanceWidth: 800,
+          path: new opentype.Path()
+        }));
+      }
+      
+      const font = new opentype.Font({
+        familyName: "TracedFont",
+        styleName: 'Regular',
+        unitsPerEm: 1000,
+        ascender: 800,
+        descender: -200,
+        glyphs: glyphs,
+      });
+      
+      const buffer = font.toArrayBuffer();
+      
+      const fontFace = new FontFace(`Test`, buffer);
+      await fontFace.load();
+      document.body.innerHTML = 'SUCCESS_EMPTY';
+    } catch(e) {
+      document.body.innerHTML = 'ERROR_EMPTY: ' + e.message;
+    }
+  }
+  run();
+</script>
+</body>
+</html>

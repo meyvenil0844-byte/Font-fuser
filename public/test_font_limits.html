@@ -1,0 +1,21 @@
+<!DOCTYPE html><html><body><script>
+    async function test() {
+      try {
+        const resTTF = await fetch('/test_ttf.ttf');
+        const bufTTF = await resTTF.arrayBuffer();
+        const fontTTF = new FontFace('TestTTF', bufTTF);
+        await fontTTF.load();
+        console.log("TTF SUCCESS");
+      } catch(e) { console.log("TTF ERROR:", e.message); }
+      
+      try {
+        const resCFF = await fetch('/test_cff.otf');
+        const bufCFF = await resCFF.arrayBuffer();
+        const fontCFF = new FontFace('TestCFF', bufCFF);
+        await fontCFF.load();
+        console.log("CFF SUCCESS");
+      } catch(e) { console.log("CFF ERROR:", e.message); }
+      document.body.innerHTML = 'DONE';
+    }
+    test();
+  </script></body></html>

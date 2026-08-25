@@ -1,0 +1,15 @@
+
+  <!DOCTYPE html>
+  <html><body>
+  <script>
+    fetch('/traced_font_test.ttf').then(res => res.arrayBuffer()).then(buffer => {
+      const fontFace = new FontFace('Test', buffer);
+      return fontFace.load();
+    }).then(() => {
+      document.body.innerHTML = 'SUCCESS_TTF';
+    }).catch(e => {
+      document.body.innerHTML = 'ERROR_TTF: ' + e.message;
+    });
+  </script>
+  </body></html>
+  
