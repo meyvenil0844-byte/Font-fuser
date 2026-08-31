@@ -233,6 +233,21 @@ app.post('/api/unpack-ttc', (req, res, next) => {
 });
 
 
+app.post('/api/upload-fonts-batch', (req, res, next) => {
+  upload.array('fonts', 200)(req, res, (err) => {
+    if (err) {
+      console.error('Multer error in upload-fonts-batch:', err);
+      return res.status(400).json({ error: err.message || String(err) });
+    }
+    next();
+  });
+}, (req, res) => {
+  console.log('Received upload-fonts-batch request');
+  if (!req.files || !Array.isArray(req.files)) return res.status(400).json({ error: 'No files uploaded' });
+  const fontIds = req.files.map(f => f.filename);
+  res.json({ fontIds });
+});
+
 app.post('/api/upload-font', (req, res, next) => {
   upload.single('font')(req, res, (err) => {
     if (err) {
@@ -253,6 +268,24 @@ app.post('/api/upload-font', (req, res, next) => {
 import crypto from 'crypto';
 
 const activeJobs = new Map();
+
+// Periodic cleanup of old uploaded files (older than 1 hour)
+setInterval(() => {
+  try {
+    const now = Date.now();
+    fs.readdirSync(uploadDir).forEach(f => {
+      const filePath = path.join(uploadDir, f);
+      const stat = fs.statSync(filePath);
+      if (now - stat.mtimeMs > 60 * 60 * 1000) {
+        fs.unlinkSync(filePath);
+        console.log('Cleaned up old file:', f);
+      }
+    });
+  } catch(e) {
+    console.error('Periodic cleanup error:', e);
+  }
+}, 15 * 60 * 1000); // Check every 15 minutes
+
 
 app.post('/api/fuse-by-ids', async (req, res) => {
   try {

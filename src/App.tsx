@@ -32,17 +32,7 @@ export default function App() {
   useEffect(() => {
     async function load() {
       try {
-        // Crash loop detector
-        if (localStorage.getItem('fontfuser_loading_workspace') === 'true') {
-           console.warn("Detected crash during previous workspace load. Clearing workspace to prevent crash loop.");
-           localStorage.removeItem('fontfuser_loading_workspace');
-           const { del } = await import('idb-keyval');
-           await del('font-fuser-workspace');
-           throw new Error("Workspace cleared due to crash loop.");
-        }
-        localStorage.setItem('fontfuser_loading_workspace', 'true');
         const saved = await loadWorkspace();
-        localStorage.removeItem('fontfuser_loading_workspace');
         setTimeout(cleanupOrphanedFonts, 5000); // Cleanup in background after 5s
         if (saved && saved.fonts.length > 0) {
           setFonts(saved.fonts);

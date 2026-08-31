@@ -45,21 +45,20 @@ async function migrateSavesIfNeeded(fusions: FusionSave[]) {
 export async function saveWorkspace(fonts: UploadedFont[], glyphMap: GlyphMapping) {
   try {
     const existingKeys = new Set(await keys());
-    const savedFonts = await Promise.all(
-      fonts.map(async (f) => {
-        const fileKey = `font-file-${f.id}`;
-        if (!existingKeys.has(fileKey)) {
-          const buffer = await f.file.arrayBuffer();
-          await set(fileKey, buffer);
-        }
-        return {
-          id: f.id,
-          name: f.name,
-          fileName: f.fileName,
-          color: f.color,
-        };
-      })
-    );
+    const savedFonts = [];
+    for (const f of fonts) {
+      const fileKey = `font-file-${f.id}`;
+      if (!existingKeys.has(fileKey)) {
+        const buffer = await f.file.arrayBuffer();
+        await set(fileKey, buffer);
+      }
+      savedFonts.push({
+        id: f.id,
+        name: f.name,
+        fileName: f.fileName,
+        color: f.color,
+      });
+    }
     
     // Also try migrating the main workspace if it has old buffers
     const oldSaved = await get<SavedWorkspace>(WORKSPACE_KEY);
@@ -112,8 +111,12 @@ async function restoreWorkspaceData(saved: SavedWorkspace): Promise<{ fonts: Upl
       const fontFamilyName = `FontFuser_${sf.id}`;
       
       const fontFace = new FontFace(fontFamilyName, buffer);
-      try { await fontFace.load(); } catch (err) { console.warn("FontFace load error", err); }
-      document.fonts.add(fontFace);
+      try { 
+        await fontFace.load(); 
+        document.fonts.add(fontFace);
+      } catch (err) { 
+        console.warn("FontFace load error", err); 
+      }
 
       loadedFonts.push({
         id: sf.id,
@@ -161,21 +164,20 @@ export async function saveNamedFusion(name: string, fonts: UploadedFont[], glyph
     await migrateSavesIfNeeded(fusions);
 
     const existingKeys = new Set(await keys());
-    const savedFonts = await Promise.all(
-      fonts.map(async (f) => {
-        const fileKey = `font-file-${f.id}`;
-        if (!existingKeys.has(fileKey)) {
-          const buffer = await f.file.arrayBuffer();
-          await set(fileKey, buffer);
-        }
-        return {
-          id: f.id,
-          name: f.name,
-          fileName: f.fileName,
-          color: f.color,
-        };
-      })
-    );
+    const savedFonts = [];
+    for (const f of fonts) {
+      const fileKey = `font-file-${f.id}`;
+      if (!existingKeys.has(fileKey)) {
+        const buffer = await f.file.arrayBuffer();
+        await set(fileKey, buffer);
+      }
+      savedFonts.push({
+        id: f.id,
+        name: f.name,
+        fileName: f.fileName,
+        color: f.color,
+      });
+    }
     
     fusions.push({
       id: crypto.randomUUID(),

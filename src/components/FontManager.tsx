@@ -52,8 +52,12 @@ export function FontManager({ fonts, setFonts, onApplyFont, hasSelection, setGly
         // Inject @font-face
         const buffer = await ttfFile.arrayBuffer();
         const fontFace = new FontFace(fontFamilyName, buffer);
-        try { await fontFace.load(); } catch (e) { console.warn(e); }
-        document.fonts.add(fontFace);
+        try { 
+          await fontFace.load(); 
+          document.fonts.add(fontFace);
+        } catch (e) { 
+          console.warn("FontManager FontFace load error:", e); 
+        }
         
         // Check for metadata
         let parsedGlyphMap = null;

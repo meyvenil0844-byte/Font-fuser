@@ -3,7 +3,7 @@ import { UNICODE_BLOCKS } from '../lib/unicodeBlocks';
 import { safeStringFromCodePoint, traceImageToFont } from '../lib/fontUtils';
 import type { UploadedFont, GlyphMapping, UnicodeBlock } from '../types';
 import { cn } from '../lib/utils';
-import { MousePointer2, PaintBucket, Trash2 } from 'lucide-react';
+import { MousePointer2, PaintBucket, Trash2, Search } from 'lucide-react';
 import { VirtuosoGrid } from 'react-virtuoso';
 
 interface UnicodeExplorerProps {
@@ -21,6 +21,44 @@ export function UnicodeExplorer({ fonts, setFonts, glyphMap, setGlyphMap, select
   const [dragSelecting, setDragSelecting] = useState(false);
   const [dragState, setDragState] = useState<'select' | 'deselect'>('select');
   const [showEmpty, setShowEmpty] = useState(true);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [glyphSearchQuery, setGlyphSearchQuery] = useState('');
+  
+
+  const filteredBlocks = useMemo(() => {
+    if (!searchQuery.trim()) return UNICODE_BLOCKS.map((b, i) => ({ ...b, originalIndex: i }));
+    
+    const query = searchQuery.toLowerCase();
+    
+    const chars = Array.from(searchQuery as string);
+    if (chars.length === 1) {
+      const cp = chars[0].codePointAt(0);
+      if (cp !== undefined) {
+        return UNICODE_BLOCKS.map((b, i) => ({ ...b, originalIndex: i })).filter(b => 
+          (cp >= b.start && cp <= b.end) || b.name.toLowerCase().includes(query)
+        );
+      }
+    }
+    
+    return UNICODE_BLOCKS.map((b, i) => ({ ...b, originalIndex: i })).filter(b => {
+      if (b.name.toLowerCase().includes(query)) return true;
+      let hexQuery = query.replace(/^(u\+|0x)/i, '').trim();
+      if (/^[0-9a-f]+$/i.test(hexQuery)) {
+         const cp = parseInt(hexQuery, 16);
+         if (cp >= b.start && cp <= b.end) return true;
+      }
+      return false;
+    });
+  }, [searchQuery]);
+
+  useEffect(() => {
+    if (filteredBlocks.length > 0 && searchQuery.trim() !== '') {
+       const hasCurrent = filteredBlocks.some(b => b.originalIndex === selectedBlockIndex);
+       if (!hasCurrent) {
+          setSelectedBlockIndex(filteredBlocks[0].originalIndex);
+       }
+    }
+  }, [filteredBlocks, selectedBlockIndex, setSelectedBlockIndex, searchQuery]);
 
   const block = UNICODE_BLOCKS[selectedBlockIndex];
   
@@ -29,26 +67,86 @@ export function UnicodeExplorer({ fonts, setFonts, glyphMap, setGlyphMap, select
   // Generate characters for current block
   const characters = useMemo(() => {
     const chars = [];
-    for (let cp = block.start; cp <= block.end; cp++) {
-      const charStr = safeStringFromCodePoint(cp);
-      if (!charStr) continue; // Skip unrenderable (surrogates)
+    const query = glyphSearchQuery.trim().toLowerCase();
+    
+    const isForgottenBlock = block.name === 'Forgotten Characters';
+    
+    // Explicit list of tricky/forgotten/meta codepoints that font devs care about
+    const forgottenList = [
+      0x0000, // NULL
+      0x0009, // Tab
+      0x000A, // LF
+      0x000D, // CR
+      0x0020, // Space
+      0x00A0, // NBSP
+      0x00AD, // Soft Hyphen
+      0x200B, // ZWSP
+      0x200C, // ZWNJ
+      0x200D, // ZWJ
+      0x2028, // Line Separator
+      0x2029, // Paragraph Separator
+      0x2060, // Word Joiner
+      0xFEFF, // ZWNBSP / BOM
+      0xFFFD, // Replacement Character (.notdef fallback)
+    ];
 
-      if (!showEmpty && baseFont) {
-        const mappedId = glyphMap[cp];
-        const fontToCheck = null;
-        
-        if (fontToCheck) {
-          const glyphIndex = fontToCheck.charToGlyphIndex(charStr);
-          if (glyphIndex === 0) continue; // .notdef
-        } else {
-          continue;
+    if (isForgottenBlock) {
+      for (const cp of forgottenList) {
+        if (query) {
+          const hex = cp.toString(16).toUpperCase().padStart(4, '0');
+          if (!hex.toLowerCase().includes(query)) continue;
         }
+        chars.push(cp);
+      }
+      return chars;
+    }
+
+    const start = block.start;
+    const end = block.end;
+
+    for (let cp = start; cp <= end; cp++) {
+      const charStr = safeStringFromCodePoint(cp);
+      let isMissing = false;
+      
+      const mappedId = glyphMap[cp];
+      const displayFont = mappedId ? fonts.find(f => f.id === mappedId) : baseFont;
+
+      if (!charStr) {
+         isMissing = true; // Surrogate or unrenderable
+      } else {
+         if (displayFont && displayFont.parsed) {
+            const glyphIndex = displayFont.parsed.charToGlyphIndex(charStr);
+            if (glyphIndex === 0) {
+               isMissing = true; // .notdef
+            }
+         } else {
+            isMissing = true; // No font or no glyphs
+         }
+      }
+
+      if (!charStr) continue; // Standard blocks skip unrenderables natively
+      if (!showEmpty && isMissing) continue; // Standard blocks hide empty if toggled off
+
+      if (query) {
+         let match = false;
+         if (displayFont && displayFont.parsed && charStr) {
+             const glyphIndex = displayFont.parsed.charToGlyphIndex(charStr);
+             const glyph = displayFont.parsed.glyphs.get(glyphIndex);
+             if (glyph && glyph.name && glyph.name.toLowerCase().includes(query)) {
+                 match = true;
+             }
+         }
+         const hex = cp.toString(16).toUpperCase().padStart(4, '0');
+         if (hex.toLowerCase().includes(query)) match = true;
+         if (charStr && charStr.toLowerCase() === query) match = true;
+         
+         if (!match) continue;
       }
 
       chars.push(cp);
     }
     return chars;
-  }, [block, showEmpty, baseFont, glyphMap, fonts]);
+  }, [block, showEmpty, baseFont, glyphMap, fonts, glyphSearchQuery]);
 
   // When block changes, clear selection
   useEffect(() => {
@@ -205,16 +303,39 @@ export function UnicodeExplorer({ fonts, setFonts, glyphMap, setGlyphMap, select
   return (
     <div className="flex-1 flex flex-col min-h-0 bg-[#0d0d0d]">
       <div className="p-4 flex flex-col sm:flex-row sm:items-center justify-between border-b border-white/5 bg-[#0d0d0d] gap-4 shrink-0">
-        <div className="flex flex-col gap-1">
+        <div className="flex flex-col gap-2 w-full max-w-[350px]">
+          <div className="relative">
+            <Search className="absolute left-2 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-gray-500" />
+            <input
+              type="text"
+              placeholder="Search blocks (e.g. 'emoji') or characters (e.g. 'A', 'U+0041')"
+              value={searchQuery}
+              onChange={e => setSearchQuery(e.target.value)}
+              className="bg-[#1a1a1a] border border-white/10 text-xs py-1.5 pl-8 pr-2 rounded outline-none focus:border-blue-500 text-gray-200 w-full"
+            />
+          </div>
           <select 
             value={selectedBlockIndex}
             onChange={(e) => setSelectedBlockIndex(Number(e.target.value))}
-            className="bg-[#1a1a1a] border border-white/10 text-xs p-1.5 rounded outline-none focus:border-blue-500 text-gray-200"
+            className="bg-[#1a1a1a] border border-white/10 text-xs p-1.5 rounded outline-none focus:border-blue-500 text-gray-200 w-full"
           >
-            {UNICODE_BLOCKS.map((b, i) => (
-              <option key={b.name} value={i}>{b.name} (U+{b.start.toString(16).toUpperCase()} - U+{b.end.toString(16).toUpperCase()})</option>
+            {filteredBlocks.map((b) => (
+              <option key={b.name} value={b.originalIndex}>{b.name} {b.start >= 0 ? `(U+${b.start.toString(16).toUpperCase()} - U+${b.end.toString(16).toUpperCase()})` : ''}</option>
             ))}
+            {filteredBlocks.length === 0 && (
+              <option disabled value={-1}>No results found</option>
+            )}
           </select>
+          <div className="relative mt-1">
+            <Search className="absolute left-2 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-gray-500" />
+            <input
+              type="text"
+              placeholder="Filter by glyph name (e.g. 'arrow', 'face')"
+              value={glyphSearchQuery}
+              onChange={e => setGlyphSearchQuery(e.target.value)}
+              className="bg-[#1a1a1a] border border-white/10 text-xs py-1.5 pl-8 pr-2 rounded outline-none focus:border-blue-500 text-gray-200 w-full"
+            />
+          </div>
           <label className="flex items-center gap-2 text-[10px] uppercase font-bold tracking-widest text-gray-500 cursor-pointer select-none mt-2">
             <input 
               type="checkbox" 
@@ -292,6 +413,8 @@ export function UnicodeExplorer({ fonts, setFonts, glyphMap, setGlyphMap, select
           >
             <Trash2 className="w-3.5 h-3.5" /> Clear Mappings
           </button>
+          
+          
         </div>
       </div>
 
@@ -356,13 +479,17 @@ export function UnicodeExplorer({ fonts, setFonts, glyphMap, setGlyphMap, select
                   )}
                   
                   <span 
-                    className="text-2xl" 
+                    className="text-2xl flex items-center justify-center" 
                     style={{ 
                       fontFamily: displayFont?.fontFamilyName || 'inherit',
                       color: isMapped ? '#e5e5e5' : '#888'
                     }}
                   >
-                    {safeStringFromCodePoint(cp)}
+                    {(block.name === 'Forgotten Characters' && cp !== 0xFFFD && cp !== 0x0020) ? (
+                       <div className="text-[10px] font-mono border border-dashed border-gray-600 px-1 text-gray-500 opacity-50 min-w-[12px] min-h-[12px] flex items-center justify-center">
+                         {safeStringFromCodePoint(cp)}
+                       </div>
+                    ) : safeStringFromCodePoint(cp) || <span className="text-[10px] font-mono border border-dashed border-gray-600 px-1 text-gray-500">.notdef</span>}
                   </span>
                   <span className={cn(
                     "text-[9px] font-mono mt-1",

@@ -300,8 +300,12 @@ export async function traceImageToFont(file: File, fileName: string, cps: number
   const id = crypto.randomUUID();
   
   const fontFace = new FontFace(`FontFuser_${id}`, buffer);
-  await fontFace.load();
-  document.fonts.add(fontFace);
+  try {
+    await fontFace.load();
+    document.fonts.add(fontFace);
+  } catch(e) {
+    console.warn("Failed to load traced fontface", e);
+  }
   
   return {
     id,
@@ -358,18 +362,47 @@ export async function generateFusedFont(
     if (contentType && contentType.includes('text/html')) {
        throw new Error("Server is currently restarting or unavailable. Please wait a moment and try again.");
     }
+    const __ct_res = res.headers.get('content-type');
+    if (__ct_res && __ct_res.includes('text/html')) {
+        const text = await res.text().catch(()=>'');
+        throw new Error(`Server returned HTML instead of JSON for ${res.url} (${res.status}). Response: ${text.substring(0, 100)}`);
+    }
     const data = await res.json();
     serverFontIds[font.id] = data.fontId;
   };
 
-  if (onProgress) onProgress('Uploading base font...');
-  await uploadFont(baseFontInfo);
-
-  for (let i = 0; i < fonts.length; i++) {
-    const font = fonts[i];
+  if (onProgress) onProgress('Uploading fonts to server...');
+  
+  const allFontsToUpload = [baseFontInfo];
+  for (const font of fonts) {
     if (font.id !== baseFontInfo.id && font.file) {
-      if (onProgress) onProgress(`Uploading font ${i+1} of ${fonts.length}...`);
-      await uploadFont(font);
+      allFontsToUpload.push(font);
+    }
+  }
+
+  // Batch upload in chunks of 50 to avoid any limits
+  const BATCH_SIZE = 5; // Reduced from 50 to prevent payload timeouts
+  for (let i = 0; i < allFontsToUpload.length; i += BATCH_SIZE) {
+    const chunk = allFontsToUpload.slice(i, i + BATCH_SIZE);
+    if (onProgress) onProgress(`Uploading fonts ${i+1} to ${Math.min(i + BATCH_SIZE, allFontsToUpload.length)} of ${allFontsToUpload.length}...`);
+    
+    const fd = new FormData();
+    for (const font of chunk) {
+      fd.append('fonts', font.file);
+    }
+    
+    const res = await fetch('/api/upload-fonts-batch', { method: 'POST', body: fd });
+    if (!res.ok) {
+       throw new Error(`Failed to upload batch: ${res.statusText}`);
+    }
+    const __ct_res = res.headers.get('content-type');
+    if (__ct_res && __ct_res.includes('text/html')) {
+        const text = await res.text().catch(()=>'');
+        throw new Error(`Server returned HTML instead of JSON for ${res.url} (${res.status}). Response: ${text.substring(0, 100)}`);
+    }
+    const data = await res.json();
+    for (let j = 0; j < chunk.length; j++) {
+       serverFontIds[chunk[j].id] = data.fontIds[j];
     }
   }
 
@@ -395,7 +428,12 @@ export async function generateFusedFont(
      }
   }
 
-  const { jobId } = await response.json();
+  const __ct_response = response.headers.get('content-type');
+    if (__ct_response && __ct_response.includes('text/html')) {
+        const text = await response.text().catch(()=>'');
+        throw new Error(`Server returned HTML instead of JSON for ${response.url} (${response.status}). Response: ${text.substring(0, 100)}`);
+    }
+    const { jobId } = await response.json();
   
   let finalResponse;
   while (true) {
@@ -412,7 +450,12 @@ export async function generateFusedFont(
          }
          throw new Error(`Failed to get status: ${statusRes.statusText}`);
       }
-      const statusData = await statusRes.json();
+      const __ct_statusRes = statusRes.headers.get('content-type');
+    if (__ct_statusRes && __ct_statusRes.includes('text/html')) {
+        const text = await statusRes.text().catch(()=>'');
+        throw new Error(`Server returned HTML instead of JSON for ${statusRes.url} (${statusRes.status}). Response: ${text.substring(0, 100)}`);
+    }
+    const statusData = await statusRes.json();
       if (statusData.status === 'progress') {
          if (onProgress) onProgress(statusData.message || 'Fusing...');
       } else if (statusData.status === 'error') {

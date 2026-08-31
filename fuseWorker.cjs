@@ -59,31 +59,44 @@ function scalePath(path, scale, isCFF) {
 try {
   const { glyphMap, baseFontId, serverFontIds, uploadDir } = workerData;
   
-  const parsedFonts = new Map();
   let baseFontParsed = null;
-  
-  for (const [clientId, serverFilename] of Object.entries(serverFontIds)) {
+  {
+    const serverFilename = serverFontIds[baseFontId];
+    if (!serverFilename) throw new Error("Base font missing");
     const filePath = path.join(uploadDir, serverFilename);
-    if (!fs.existsSync(filePath)) {
-      throw new Error(`Uploaded font file missing for ${clientId}`);
-    }
+    if (!fs.existsSync(filePath)) throw new Error("Base font file missing");
     const buffer = fs.readFileSync(filePath);
     const ab = buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
+    baseFontParsed = opentype.parse(ab);
+  }
+  
+  // Cache for target fonts to avoid memory bloat
+  const parsedFontsCache = new Map();
+  const MAX_CACHE = 100;
+  
+  function getTargetFont(clientId) {
+    if (parsedFontsCache.has(clientId)) return parsedFontsCache.get(clientId);
+    const serverFilename = serverFontIds[clientId];
+    if (!serverFilename) return null;
+    const filePath = path.join(uploadDir, serverFilename);
+    if (!fs.existsSync(filePath)) return null;
     
+    const buffer = fs.readFileSync(filePath);
+    const ab = buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
     const font = opentype.parse(ab);
-    parsedFonts.set(clientId, font);
-    if (clientId === baseFontId) baseFontParsed = font;
+    
+    if (parsedFontsCache.size >= MAX_CACHE) {
+      const firstKey = parsedFontsCache.keys().next().value;
+      parsedFontsCache.delete(firstKey);
+    }
+    parsedFontsCache.set(clientId, font);
+    return font;
   }
   
   if (!baseFontParsed) throw new Error('Failed to parse base font');
   
   const targetUnitsPerEm = baseFontParsed.unitsPerEm;
   const isCFF = true;
-  const newGlyphs = [];
-  
-  for (let i = 0; i < baseFontParsed.glyphs.length; i++) {
-    newGlyphs.push(baseFontParsed.glyphs.get(i));
-  }
   
   const mappedCodepoints = new Set(Object.keys(glyphMap).map(Number));
   let missingCount = 0;
@@ -92,20 +105,32 @@ try {
   
   for (const cp of mappedCodepoints) {
     const targetFontId = glyphMap[String(cp)];
-    const targetFont = parsedFonts.get(targetFontId);
+    const targetFont = getTargetFont(targetFontId);
     if (!targetFont) continue;
     
     let sourceGlyphIndex = targetFont.charToGlyphIndex(String.fromCodePoint(cp));
     if (!sourceGlyphIndex || sourceGlyphIndex <= 0) { 
-      if (targetFont.names && targetFont.names.fontFamily && targetFont.names.fontFamily.en === 'TracedFont') {
+       if (targetFont.names && targetFont.names.fontFamily && targetFont.names.fontFamily.en === 'TracedFont') {
         sourceGlyphIndex = targetFont.charToGlyphIndex('A');
       }
     }
-    if (!sourceGlyphIndex || sourceGlyphIndex <= 0) { 
-       missingCount++; continue; 
+    
+    let isSourceValid = false;
+    if (sourceGlyphIndex > 0) {
+        isSourceValid = true;
+    } else if (sourceGlyphIndex === 0 && (cp === 0xFFFD || cp === 0)) {
+        isSourceValid = true;
+    }
+    
+    if (!isSourceValid) {
+        missingCount++; continue; 
     }
     
     let baseGlyphIndex = baseFontParsed.charToGlyphIndex(String.fromCodePoint(cp));
+    if (cp === 0xFFFD && (!baseGlyphIndex || baseGlyphIndex <= 0)) {
+        baseGlyphIndex = 0; 
+    }
+
     const sourceGlyph = targetFont.glyphs.get(sourceGlyphIndex);
     const scale = targetUnitsPerEm / targetFont.unitsPerEm;
     
@@ -113,25 +138,43 @@ try {
       name: cp === 0 ? '.null' : (sourceGlyph.name || `uni${cp.toString(16).toUpperCase()}`),
       unicode: cp,
       advanceWidth: Math.round((sourceGlyph.advanceWidth || 0) * scale),
-      path: scalePath(sourceGlyph.path, scale, isCFF)
+      path: scale === 1 ? sourceGlyph.path : scalePath(sourceGlyph.path, scale, isCFF)
     });
     
+    let replaceExisting = false;
     if (baseGlyphIndex > 0) {
-      const oldGlyph = newGlyphs[baseGlyphIndex];
+        replaceExisting = true;
+    } else if (baseGlyphIndex === 0 && (cp === 0xFFFD || cp === 0)) {
+        replaceExisting = true;
+    }
+
+    if (replaceExisting) {
+      baseFontParsed.glyphs.get(baseGlyphIndex); // cache it
+      const oldGlyph = baseFontParsed.glyphs.glyphs[baseGlyphIndex];
       let onlyUsedByCp = false;
-      if (!oldGlyph.unicodes || oldGlyph.unicodes.length <= 1) onlyUsedByCp = true;
+      if (oldGlyph && (!oldGlyph.unicodes || oldGlyph.unicodes.length <= 1)) onlyUsedByCp = true;
       
-      if (onlyUsedByCp) {
-        newGlyphs[baseGlyphIndex] = newGlyph;
+      if (onlyUsedByCp || baseGlyphIndex === 0) {
+        baseFontParsed.glyphs.glyphs[baseGlyphIndex] = newGlyph;
       } else {
         oldGlyph.unicodes = oldGlyph.unicodes.filter((u) => u !== cp);
         if (oldGlyph.unicode === cp) {
           oldGlyph.unicode = oldGlyph.unicodes && oldGlyph.unicodes.length > 0 ? oldGlyph.unicodes[0] : undefined;
         }
-        if (newGlyphs.length < 65535) newGlyphs.push(newGlyph); else hitLimit = true;
+        if (baseFontParsed.glyphs.length < 65535) {
+          baseFontParsed.glyphs.glyphs[baseFontParsed.glyphs.length] = newGlyph;
+          baseFontParsed.glyphs.length++;
+        } else {
+          hitLimit = true;
+        }
       }
     } else {
-      if (newGlyphs.length < 65535) newGlyphs.push(newGlyph); else hitLimit = true;
+      if (baseFontParsed.glyphs.length < 65535) {
+        baseFontParsed.glyphs.glyphs[baseFontParsed.glyphs.length] = newGlyph;
+        baseFontParsed.glyphs.length++;
+      } else {
+        hitLimit = true;
+      }
     }
     
     processed++;
@@ -140,31 +183,23 @@ try {
   
   parentPort.postMessage({ type: 'progress', message: 'Generating final font buffer...' });
   
-  const newFont = new opentype.Font({
-    familyName: "FusedFont",
-    styleName: 'Regular',
-    unitsPerEm: targetUnitsPerEm,
-    ascender: baseFontParsed.ascender,
-    descender: baseFontParsed.descender,
-    glyphs: newGlyphs,
-  });
-  
   const metaPayload = JSON.stringify({ glyphMap: glyphMap });
+  if (!baseFontParsed.names) baseFontParsed.names = {};
+  
   for (const platform of ['macintosh', 'windows', 'unicode']) {
-    if (newFont.names[platform]) {
-      newFont.names[platform].description = { en: metaPayload };
-    }
+    if (!baseFontParsed.names[platform]) baseFontParsed.names[platform] = {};
+    baseFontParsed.names[platform].description = { en: metaPayload };
+    baseFontParsed.names[platform].fontFamily = { en: 'FusedFont' };
   }
   
-  newFont.outlinesFormat = 'truetype';
+  baseFontParsed.outlinesFormat = 'truetype';
   
-  parsedFonts.clear();
-  baseFontParsed = null;
+  parsedFontsCache.clear();
   if (typeof global.gc === 'function') {
     global.gc();
   }
   
-  const buffer = newFont.toArrayBuffer();
+  const buffer = baseFontParsed.toArrayBuffer();
   
   const outputFilename = 'FusedFont_' + Date.now() + '.ttf';
   const outputPath = path.join(uploadDir, outputFilename);
