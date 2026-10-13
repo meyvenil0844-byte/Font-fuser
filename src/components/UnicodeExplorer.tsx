@@ -40,7 +40,22 @@ function getBlockIndexForCodepoint(cp: number): number {
       return mid;
     }
   }
-  return -1;
+}
+
+export function isCombiningMark(cp: number): boolean {
+  // Combining Diacritical Marks (0x0300 - 0x036F)
+  if (cp >= 0x0300 && cp <= 0x036F) return true;
+  // Combining Diacritical Marks Extended (0x1AB0 - 0x1AFF)
+  if (cp >= 0x1AB0 && cp <= 0x1AFF) return true;
+  // Combining Diacritical Marks Supplement (0x1DC0 - 0x1DFF)
+  if (cp >= 0x1DC0 && cp <= 0x1DFF) return true;
+  // Combining Diacritical Marks for Symbols (0x20D0 - 0x20FF)
+  if (cp >= 0x20D0 && cp <= 0x20FF) return true;
+  // Combining Half Marks (0xFE20 - 0xFE2F)
+  if (cp >= 0xFE20 && cp <= 0xFE2F) return true;
+  // Znamenny Musical Notation combining cinnabar marks (0x1CF00 - 0x1CF46)
+  if (cp >= 0x1CF00 && cp <= 0x1CF46) return true;
+  return false;
 }
 
 const bestBlockByFontIdCache = new Map<string, { index: number; name: string; count: number }>();
@@ -903,6 +918,10 @@ export function UnicodeExplorer({ fonts, setFonts, glyphMap, setGlyphMap, select
           <span className="text-[10px] text-gray-400 hidden md:inline">
             {characters.length} glyphs
           </span>
+          <span className="text-gray-600 hidden sm:inline">•</span>
+          <span className="text-[10px] font-mono text-blue-300 bg-blue-500/10 px-1.5 py-0.5 rounded border border-blue-500/20 flex items-center gap-1" title="Total active glyph swaps across fonts">
+            <strong className="text-blue-400 font-bold">{Object.keys(glyphMap).length}</strong> swaps
+          </span>
           {selectedCharacters.size > 0 && (
             <span className="text-[10px] text-blue-400 font-semibold bg-blue-500/10 px-1.5 py-0.5 rounded border border-blue-500/20">
               {selectedCharacters.size} selected
@@ -974,9 +993,11 @@ export function UnicodeExplorer({ fonts, setFonts, glyphMap, setGlyphMap, select
                 };
               }
             }}
-            style={{ height: '100%' }}
+            style={{ height: '100%', width: '100%' }}
+            overscan={400}
+            increaseViewportBy={{ top: 600, bottom: 800 }}
             data={characters}
-            listClassName="grid zoomable-grid gap-3 p-6 touch-pan-y touch-manipulation"
+            listClassName="grid zoomable-grid gap-3 p-6 touch-pan-y touch-manipulation min-h-full"
             itemContent={(index, cp) => {
               const mappedFontId = glyphMap[cp];
               const displayFont = mappedFontId 
@@ -998,10 +1019,15 @@ export function UnicodeExplorer({ fonts, setFonts, glyphMap, setGlyphMap, select
               const dupControlInfo = isDupControl ? getDuployanControlInfo(cp) : null;
               const isDupAffix = isDuployanAffixOrMark(cp);
               const isDupUnassigned = isDuployan && isDuployanUnassigned(cp);
+              const isCombining = isCombiningMark(cp);
 
               let tooltipTitle = `U+${cp.toString(16).toUpperCase().padStart(4, '0')}`;
               if (isMapped && displayFont) tooltipTitle += ` (${displayFont.name})`;
-              if (hasColorGlyph) tooltipTitle += ` [Color: ${colorRecord?.hasSVG ? 'SVG in OpenType' : 'COLR / CPAL'}]`;
+              if (hasColorGlyph) {
+                const colorLabel = colorRecord?.layers?.[0]?.color ? ` [Color: ${colorRecord.layers[0].color}]` : ' [Color Font]';
+                tooltipTitle += colorRecord?.hasSVG ? ' [SVG in OpenType]' : colorLabel;
+              }
+              if (isCombining) tooltipTitle += ` [Combining Mark]`;
               if (isDuployan && DUPLOYAN_NAMES[cp]) tooltipTitle += ` [${DUPLOYAN_NAMES[cp]}]`;
               else if (ligatureInfo) tooltipTitle += ` [${ligatureInfo.name}]`;
               else if (joiningType) {
@@ -1091,7 +1117,9 @@ export function UnicodeExplorer({ fonts, setFonts, glyphMap, setGlyphMap, select
                       className="flex-1 w-full flex items-center justify-center text-2xl leading-none overflow-hidden select-none min-h-0" 
                       style={{ 
                         fontFamily: `${displayFont?.fontFamilyName ? `"${displayFont.fontFamilyName}", ` : ''}'Noto Sans Duployan', sans-serif`,
-                        color: hasColorGlyph && colorRecord?.layers?.[0]?.color ? colorRecord.layers[0].color : (isMapped ? '#e5e5e5' : '#888')
+                        color: hasColorGlyph && colorRecord?.layers?.[0]?.color && colorRecord.layers[0].color !== 'currentColor'
+                          ? colorRecord.layers[0].color 
+                          : (isMapped ? '#e5e5e5' : '#888')
                       }}
                     >
                       {isDupControl ? (
@@ -1103,10 +1131,10 @@ export function UnicodeExplorer({ fonts, setFonts, glyphMap, setGlyphMap, select
                             {dupControlInfo?.label}
                           </span>
                         </div>
-                      ) : isDupAffix ? (
-                        <span className="relative flex items-center justify-center pointer-events-none">
-                          <span className="opacity-30 text-gray-500 font-sans text-xl mr-[-0.25em]">◌</span>
-                          <span>{safeStringFromCodePoint(cp)}</span>
+                      ) : (isCombining || isDupAffix) ? (
+                        <span className="relative inline-flex items-center justify-center pointer-events-none min-w-[1.2em]">
+                          <span className="opacity-25 text-gray-500 font-sans text-xl absolute select-none pointer-events-none">◌</span>
+                          <span className="relative z-10">{safeStringFromCodePoint(cp)}</span>
                         </span>
                       ) : isDupUnassigned ? (
                         <span className="text-[10px] font-mono border border-dashed border-gray-600 px-1 text-gray-500">.notdef</span>

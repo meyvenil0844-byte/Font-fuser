@@ -37,6 +37,10 @@ export function colorToBgraInt(colorStr: string): number {
   let r = 0, g = 0, b = 0, a = 255;
   const str = colorStr.trim().toLowerCase();
   
+  if (str === 'currentcolor' || str === 'inherit') {
+    return 0xFFFFFFFF;
+  }
+  
   if (str.startsWith('#')) {
     const hex = str.slice(1);
     if (hex.length === 3) {
@@ -65,24 +69,33 @@ export function colorToBgraInt(colorStr: string): number {
       g = Math.min(255, Math.max(0, Math.round(Number(match[2]))));
       b = Math.min(255, Math.max(0, Math.round(Number(match[3]))));
       if (match[4] !== undefined) {
-        a = Math.min(255, Math.max(0, Math.round(Number(match[4]) * (Number(match[4]) <= 1 ? 255 : 1))));
+        const aVal = Number(match[4]);
+        a = Math.min(255, Math.max(0, Math.round(aVal <= 1 ? aVal * 255 : aVal)));
       }
     }
   }
   
-  // CPAL / CAPL stores BGRA: (B) | (G << 8) | (R << 16) | (A << 24)
-  // uint32 representation
-  return ((b & 0xFF) | ((g & 0xFF) << 8) | ((r & 0xFF) << 16) | ((a & 0xFF) << 24)) >>> 0;
+  // CPAL stores ColorRecord: byte 0 = blue, byte 1 = green, byte 2 = red, byte 3 = alpha
+  // Opentype.js writes ULONG big-endian: (blue << 24) | (green << 16) | (red << 8) | alpha
+  return (((b & 0xFF) << 24) | ((g & 0xFF) << 16) | ((r & 0xFF) << 8) | (a & 0xFF)) >>> 0;
 }
 
 /**
- * Converts a 32-bit BGRA integer from OpenType CPAL into a hex color string #RRGGBBAA
+ * Converts a 32-bit BGRA integer from OpenType CPAL (read as big-endian ULong by opentype.js)
+ * into a hex color string #RRGGBB or #RRGGBBAA
  */
 export function bgraIntToHex(bgra: number): string {
-  const b = bgra & 0xFF;
-  const g = (bgra >> 8) & 0xFF;
-  const r = (bgra >> 16) & 0xFF;
-  const a = (bgra >> 24) & 0xFF;
+  // In OpenType CPAL specification, ColorRecord is:
+  // byte 0: blue, byte 1: green, byte 2: red, byte 3: alpha
+  // When opentype.js reads this as a big-endian ULong:
+  // bits 24..31: blue
+  // bits 16..23: green
+  // bits 8..15:  red
+  // bits 0..7:   alpha
+  const b = (bgra >>> 24) & 0xFF;
+  const g = (bgra >>> 16) & 0xFF;
+  const r = (bgra >>> 8) & 0xFF;
+  const a = bgra & 0xFF;
   
   const toHex2 = (v: number) => v.toString(16).padStart(2, '0');
   if (a === 255) {
@@ -266,7 +279,7 @@ export function extractColorFontInfo(font: any): ColorFontData {
     const decoder = new TextDecoder('utf-8');
     if (svgTable instanceof Map && svgTable.size > 0) {
       result.hasSVG = true;
-      for (const [gid, bytes] of svgTable.entries()) {
+      svgTable.forEach((bytes, gid) => {
         try {
           const svgStr = typeof bytes === 'string' ? bytes : decoder.decode(bytes);
           const existing: ColorGlyphRecord = result.colorGlyphs.get(gid) || { glyphIndex: gid };
@@ -274,7 +287,7 @@ export function extractColorFontInfo(font: any): ColorFontData {
           existing.hasSVG = true;
           result.colorGlyphs.set(gid, existing);
         } catch (e) {}
-      }
+      });
     } else if (typeof svgTable === 'object' && Object.keys(svgTable).length > 0) {
       result.hasSVG = true;
       for (const [gidStr, bytes] of Object.entries(svgTable)) {
@@ -322,12 +335,25 @@ export function extractColorFontInfo(font: any): ColorFontData {
       }
     }
 
+    // Direct glyph unicode lookup if available without triggering outline parse
+    if (font.glyphs) {
+      const gLen = typeof font.glyphs.length === 'number' ? font.glyphs.length : 0;
+      for (let i = 0; i < gLen; i++) {
+        if (!glyphIdToUnicode.has(i)) {
+          const g = typeof font.glyphs.get === 'function' ? font.glyphs.get(i) : (font.glyphs.glyphs ? font.glyphs.glyphs[i] : null);
+          if (g && typeof g.unicode === 'number' && g.unicode > 0) {
+            glyphIdToUnicode.set(i, g.unicode);
+          }
+        }
+      }
+    }
+
     // Assign codepoints instantly without triggering expensive glyph outline decompilations
-    for (const [gid, record] of result.colorGlyphs.entries()) {
+    result.colorGlyphs.forEach((record, gid) => {
       let unicode = glyphIdToUnicode.get(gid);
-      if (unicode === undefined && font.glyphs?.glyphs && Array.isArray(font.glyphs.glyphs)) {
-        const g = font.glyphs.glyphs[gid];
-        if (g && typeof g.unicode === 'number') {
+      if (unicode === undefined && font.glyphs) {
+        const g = typeof font.glyphs.get === 'function' ? font.glyphs.get(gid) : (font.glyphs.glyphs ? font.glyphs.glyphs[gid] : null);
+        if (g && typeof g.unicode === 'number' && g.unicode > 0) {
           unicode = g.unicode;
         }
       }
@@ -335,7 +361,7 @@ export function extractColorFontInfo(font: any): ColorFontData {
         record.codepoint = unicode;
         result.codepointColorMap.set(unicode, record);
       }
-    }
+    });
   }
   
   return result;
@@ -385,12 +411,11 @@ export function mergeColorTables(
   
   // Check if any source font or base font has color
   let anyFontHasColor = baseColorInfo.hasColor;
-  for (const font of parsedFonts.values()) {
+  parsedFonts.forEach((font) => {
     if (extractColorFontInfo(font).hasColor) {
       anyFontHasColor = true;
-      break;
     }
-  }
+  });
   
   if (!anyFontHasColor) {
     return {
@@ -517,8 +542,11 @@ export function mergeColorTables(
         
         // Ensure layer glyph exists in newGlyphs
         let layerGid = l.glyphIndex;
-        // If layer glyph is beyond original glyphs, we map or clone it
-        if (l.glyphIndex < targetFont.glyphs.length) {
+        if (l.glyphIndex === sourceGid) {
+          // If layer glyph is the source glyph itself (like in single-layer color fonts such as Noto Znamenny),
+          // map directly to targetGid in the fused font
+          layerGid = targetGid;
+        } else if (l.glyphIndex < targetFont.glyphs.length) {
           const layerGlyph = targetFont.glyphs.get(l.glyphIndex);
           if (layerGlyph) {
             // Find existing identical glyph or append as unmapped layer glyph

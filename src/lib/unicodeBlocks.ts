@@ -276,6 +276,7 @@ export const UNICODE_BLOCKS: UnicodeBlock[] = [
   { name: 'Bassa Vah', start: 0x16AD0, end: 0x16AFF },
   { name: 'Pahawh Hmong', start: 0x16B00, end: 0x16B8F },
   { name: 'Kirat Rai', start: 0x16D40, end: 0x16D7F },
+  { name: 'Chisoi', start: 0x16D80, end: 0x16DAF },
   { name: 'Medefaidrin', start: 0x16E40, end: 0x16E9F },
   { name: 'Beria Erfe', start: 0x16EA0, end: 0x16EDF },
   { name: 'Miao', start: 0x16F00, end: 0x16F9F },

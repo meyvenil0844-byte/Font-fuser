@@ -22,6 +22,7 @@ export function TypeTesterModal({ isOpen, onClose, fonts }: TypeTesterModalProps
 
   const presets = [
     { label: '🎨 Color Glyphs', text: 'COLOR UPDATE: OpenType SVG, COLR Layers & CPAL/CAPL Palettes!', rtl: false },
+    { label: '🎵 Znamenny Cinnabar Marks', text: '𜵐𜼀 𜵑𜼁 𜵒𜼂 𜵓𜼃 ◌𜼀 ◌𜼁 ◌𜼂 𜼀𜼁𜼂 (Znamenny Musical Notation with Red Cinnabar Marks)', rtl: false },
     { label: 'Caret & Math', text: 'x^2 + y^2 = z^2 | a^b | base^exponent | ^_^', rtl: false },
     { label: 'Duployan Shorthand', text: '𛰆𛱁 𛰄𛱁 𛰚𛱄 𛰆𛱄𛰚 𛱁𛲝 𛰆𛲞 𛰆𛲠𛰄 (Duployan Shorthand)', rtl: false },
     { label: 'Tibetan + Not Subset', text: 'ཀ ⊄ ཀ ⊈ ཀ ≠ ཀ ∉ ཀ ⊅ (Tibetan + Not Symbols)', rtl: false },

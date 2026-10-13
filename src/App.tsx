@@ -540,9 +540,11 @@ export default function App() {
             </span>
           </button>
 
-          <span className="text-xs font-medium text-gray-400 uppercase tracking-widest hidden sm:inline-block">
-            <strong className="text-blue-400">{mappedCount}</strong> swaps
-          </span>
+          <div className="flex items-center gap-1.5 px-3 py-1.5 bg-[#1a1a1a] border border-blue-500/30 rounded text-xs font-mono select-none" title="Total glyph swaps assigned in this project">
+            <span className="text-[10px] text-gray-400 uppercase tracking-widest font-sans hidden sm:inline">Swaps:</span>
+            <span className="text-blue-400 font-bold text-sm">{mappedCount}</span>
+            <span className="text-[10px] text-gray-400 uppercase tracking-widest font-sans sm:hidden">swaps</span>
+          </div>
           <button
             onClick={() => setIsTypeTesterOpen(true)}
             className="px-4 py-2 bg-[#1a1a1a] hover:bg-white/5 border border-white/10 text-gray-300 text-xs font-bold rounded-sm uppercase tracking-tighter transition-colors flex items-center gap-2"

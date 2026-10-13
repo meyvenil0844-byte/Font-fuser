@@ -1,4 +1,95 @@
 
+// Polyfill for DataView bounds checking to prevent "Offset is outside the bounds of the DataView"
+function installDataViewSafetyPolyfill() {
+  if (typeof globalThis === 'undefined') return;
+  const OriginalDataView = globalThis.DataView;
+  if (!OriginalDataView || OriginalDataView.__isPatched) return;
+
+  function SafeDataView(buffer, byteOffset = 0, byteLength) {
+    if (!(buffer instanceof ArrayBuffer) && !(typeof SharedArrayBuffer !== 'undefined' && buffer instanceof SharedArrayBuffer)) {
+      try {
+        if (buffer && buffer.buffer instanceof ArrayBuffer) {
+          byteOffset = (buffer.byteOffset || 0) + (byteOffset || 0);
+          buffer = buffer.buffer;
+        } else {
+          buffer = new ArrayBuffer(0);
+        }
+      } catch (e) {
+        buffer = new ArrayBuffer(0);
+      }
+    }
+    const maxLen = buffer.byteLength;
+    const safeOffset = Math.max(0, Math.min(byteOffset || 0, maxLen));
+    let safeLength = byteLength === undefined ? (maxLen - safeOffset) : byteLength;
+    if (safeLength < 0 || safeOffset + safeLength > maxLen) {
+      safeLength = Math.max(0, maxLen - safeOffset);
+    }
+    return new OriginalDataView(buffer, safeOffset, safeLength);
+  }
+
+  SafeDataView.prototype = OriginalDataView.prototype;
+  Object.setPrototypeOf(SafeDataView, OriginalDataView);
+  SafeDataView.__isPatched = true;
+  globalThis.DataView = SafeDataView;
+
+  const getters = [
+    { name: 'getInt8', size: 1, def: 0 },
+    { name: 'getUint8', size: 1, def: 0 },
+    { name: 'getInt16', size: 2, def: 0 },
+    { name: 'getUint16', size: 2, def: 0 },
+    { name: 'getInt32', size: 4, def: 0 },
+    { name: 'getUint32', size: 4, def: 0 },
+    { name: 'getFloat32', size: 4, def: 0 },
+    { name: 'getFloat64', size: 8, def: 0 },
+    { name: 'getBigInt64', size: 8, def: 0n },
+    { name: 'getBigUint64', size: 8, def: 0n }
+  ];
+
+  for (const { name, size, def } of getters) {
+    const orig = OriginalDataView.prototype[name];
+    if (typeof orig === 'function') {
+      OriginalDataView.prototype[name] = function(offset, littleEndian) {
+        if (typeof offset !== 'number' || offset < 0 || offset + size > this.byteLength) {
+          return def;
+        }
+        try {
+          return orig.call(this, offset, littleEndian);
+        } catch (e) {
+          return def;
+        }
+      };
+    }
+  }
+
+  const setters = [
+    { name: 'setInt8', size: 1 },
+    { name: 'setUint8', size: 1 },
+    { name: 'setInt16', size: 2 },
+    { name: 'setUint16', size: 2 },
+    { name: 'setInt32', size: 4 },
+    { name: 'setUint32', size: 4 },
+    { name: 'setFloat32', size: 4 },
+    { name: 'setFloat64', size: 8 },
+    { name: 'setBigInt64', size: 8 },
+    { name: 'setBigUint64', size: 8 }
+  ];
+
+  for (const { name, size } of setters) {
+    const orig = OriginalDataView.prototype[name];
+    if (typeof orig === 'function') {
+      OriginalDataView.prototype[name] = function(offset, val, littleEndian) {
+        if (typeof offset !== 'number' || offset < 0 || offset + size > this.byteLength) {
+          return;
+        }
+        try {
+          orig.call(this, offset, val, littleEndian);
+        } catch (e) {}
+      };
+    }
+  }
+}
+installDataViewSafetyPolyfill();
+
 process.on('uncaughtException', (err) => {
   console.error('[Worker uncaughtException]', err);
   if (process.send) {
@@ -348,18 +439,23 @@ try {
     const filePath = path.join(uploadDir, serverFilename);
     if (!fs.existsSync(filePath)) return null;
     
-    let buffer = fs.readFileSync(filePath);
-    let ab = buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
-    const font = opentype.parse(ab);
-    buffer = null;
-    ab = null;
-    
-    if (parsedFontsCache.size >= MAX_CACHE) {
-      const firstKey = parsedFontsCache.keys().next().value;
-      parsedFontsCache.delete(firstKey);
+    try {
+      let buffer = fs.readFileSync(filePath);
+      let ab = buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
+      const font = opentype.parse(ab);
+      buffer = null;
+      ab = null;
+      
+      if (parsedFontsCache.size >= MAX_CACHE) {
+        const firstKey = parsedFontsCache.keys().next().value;
+        parsedFontsCache.delete(firstKey);
+      }
+      parsedFontsCache.set(clientId, font);
+      return font;
+    } catch (err) {
+      console.warn(`[Worker] Failed to parse target font ${clientId} (${serverFilename}):`, err.message);
+      return null;
     }
-    parsedFontsCache.set(clientId, font);
-    return font;
   }
   
   if (!baseFontParsed) throw new Error('Failed to parse base font');
@@ -416,150 +512,200 @@ try {
       if (!targetFont) continue;
       
       for (const cp of cps) {
-    
-    let sourceGlyphIndex = targetFont.charToGlyphIndex(String.fromCodePoint(cp));
-    if (!sourceGlyphIndex || sourceGlyphIndex <= 0) { 
-       if (targetFont.names && targetFont.names.fontFamily && targetFont.names.fontFamily.en === 'TracedFont') {
-        sourceGlyphIndex = targetFont.charToGlyphIndex('A');
-      }
-    }
-    
-    let isSourceValid = false;
-    if (sourceGlyphIndex > 0) {
-        isSourceValid = true;
-    } else if (sourceGlyphIndex === 0 && (cp === 0xFFFD || cp === 0)) {
-        isSourceValid = true;
-    } else if (cp >= 0x1BC00 && cp <= 0x1BCA3) {
-        const fallbackFont = getDuployanFallbackFont();
-        if (fallbackFont) {
-          const fg = fallbackFont.charToGlyph(String.fromCodePoint(cp));
-          if (fg && fg.path && fg.path.commands && fg.path.commands.length > 0) {
-            isSourceValid = true;
+        try {
+          let sourceGlyphIndex = targetFont.charToGlyphIndex(String.fromCodePoint(cp));
+          if (!sourceGlyphIndex || sourceGlyphIndex <= 0) { 
+             if (targetFont.names && targetFont.names.fontFamily && targetFont.names.fontFamily.en === 'TracedFont') {
+              sourceGlyphIndex = targetFont.charToGlyphIndex('A');
+            }
           }
-        }
-    }
-    
-    if (!isSourceValid) {
-        missingCount++; continue; 
-    }
-    
-    let baseGlyphIndex = baseFontParsed.charToGlyphIndex(String.fromCodePoint(cp));
-    if (cp === 0xFFFD && (!baseGlyphIndex || baseGlyphIndex <= 0)) {
-        baseGlyphIndex = 0; 
-    }
-
-    const sourceGlyph = (sourceGlyphIndex > 0 || sourceGlyphIndex === 0) ? targetFont.glyphs.get(sourceGlyphIndex) : null;
-    const scale = targetUnitsPerEm / targetFont.unitsPerEm;
-    
-    let newGlyph = null;
-    if (!targetFont.precompiledCache) targetFont.precompiledCache = new Map();
-    if (sourceGlyphIndex > 0 && targetFont.precompiledCache.has(sourceGlyphIndex)) {
-      const cached = targetFont.precompiledCache.get(sourceGlyphIndex);
-      newGlyph = new opentype.Glyph({
-        name: cp === 0 ? '.null' : (sourceGlyph?.name || `uni${cp.toString(16).toUpperCase()}`),
-        unicode: cp,
-        advanceWidth: cached.advanceWidth,
-        path: new opentype.Path()
-      });
-      newGlyph._cachedMetrics = cached.metrics;
-      newGlyph._rawCharString = cached.rawCharString;
-    } else {
-      let scaledPath = sourceGlyph ? scalePath(sourceGlyph.path, scale, isCFF) : new opentype.Path();
-      let advanceW = sourceGlyph ? Math.round((sourceGlyph.advanceWidth || 0) * scale) : 0;
-      const isCaretCp = cp === 0x005E || cp === 0x02C6 || cp === 0x2038 || cp === 0x2041 || cp === 0x2303;
-      if (isCaretCp) {
-        const norm = normalizeCaretPath(scaledPath, advanceW, targetUnitsPerEm);
-        scaledPath = norm.path;
-        advanceW = norm.advanceWidth;
-      } else if (cp === 0x0640 && (!scaledPath || !scaledPath.commands || scaledPath.commands.length === 0)) {
-        const fixedTatweel = generateFixedTatweelGlyph(targetUnitsPerEm);
-        scaledPath = fixedTatweel.path;
-        advanceW = fixedTatweel.advanceWidth;
-      } else if (cp === 0x0338) {
-        const norm = normalizeCombiningOverlayPath(scaledPath, advanceW, targetUnitsPerEm);
-        scaledPath = norm.path;
-        advanceW = 0;
-      } else if (cp >= 0x1BC00 && cp <= 0x1BCA3 && (!scaledPath || !scaledPath.commands || scaledPath.commands.length === 0)) {
-        const fallbackFont = getDuployanFallbackFont();
-        if (fallbackFont) {
-          const fg = fallbackFont.charToGlyph(String.fromCodePoint(cp));
-          if (fg && fg.path && fg.path.commands && fg.path.commands.length > 0) {
-            const fScale = targetUnitsPerEm / fallbackFont.unitsPerEm;
-            scaledPath = scalePath(fg.path, fScale, isCFF);
-            advanceW = Math.round((fg.advanceWidth || 0) * fScale);
+          
+          let isSourceValid = false;
+          if (sourceGlyphIndex > 0) {
+              isSourceValid = true;
+          } else if (sourceGlyphIndex === 0 && (cp === 0xFFFD || cp === 0)) {
+              isSourceValid = true;
+          } else if (cp >= 0x1BC00 && cp <= 0x1BCA3) {
+              const fallbackFont = getDuployanFallbackFont();
+              if (fallbackFont) {
+                try {
+                  const fg = fallbackFont.charToGlyph(String.fromCodePoint(cp));
+                  if (fg) {
+                    let fgCommands = null;
+                    if (typeof fg.getPath === 'function') fgCommands = fg.getPath()?.commands;
+                    else if (fg.path) fgCommands = typeof fg.path === 'function' ? fg.path()?.commands : fg.path.commands;
+                    if (fgCommands && fgCommands.length > 0) isSourceValid = true;
+                  }
+                } catch (e) {}
+              }
           }
-        }
-      }
-      const tempGlyph = new opentype.Glyph({
-        name: cp === 0 ? '.null' : (sourceGlyph?.name || `uni${cp.toString(16).toUpperCase()}`),
-        unicode: cp,
-        advanceWidth: advanceW,
-        path: scaledPath
-      });
-      const metrics = tempGlyph.getMetrics();
-      let rawCharString = null;
-      try {
-        const ops = opentype._glyphToOps(tempGlyph, 1);
-        rawCharString = opentype._encodeCHARSTRING(ops);
-      } catch (e) {}
-      
-      targetFont.precompiledCache.set(sourceGlyphIndex, {
-        metrics,
-        advanceWidth: tempGlyph.advanceWidth,
-        rawCharString
-      });
-      
-      newGlyph = tempGlyph;
-      newGlyph._cachedMetrics = metrics;
-      newGlyph._rawCharString = rawCharString;
-      newGlyph.path.commands = [];
-    }
-    
-    let replaceExisting = false;
-    if (baseGlyphIndex > 0) {
-        replaceExisting = true;
-    }
+          
+          if (!isSourceValid) {
+              missingCount++; continue; 
+          }
+          
+          let baseGlyphIndex = 0;
+          try {
+            baseGlyphIndex = baseFontParsed.charToGlyphIndex(String.fromCodePoint(cp));
+          } catch (e) {}
+          if (cp === 0xFFFD && (!baseGlyphIndex || baseGlyphIndex <= 0)) {
+              baseGlyphIndex = 0; 
+          }
 
-    if (replaceExisting) {
-      const oldGlyph = baseFontParsed.glyphs.get(baseGlyphIndex);
-      let onlyUsedByCp = false;
-      if (!oldGlyph || !oldGlyph.unicodes || oldGlyph.unicodes.length <= 1) onlyUsedByCp = true;
-      
-      if (onlyUsedByCp) {
-        newGlyph.index = baseGlyphIndex;
-        baseFontParsed.glyphs.glyphs[baseGlyphIndex] = newGlyph;
-      } else {
-        if (oldGlyph.unicodes) {
-          oldGlyph.unicodes = oldGlyph.unicodes.filter((u) => u !== cp);
+          let sourceGlyph = null;
+          try {
+            sourceGlyph = (sourceGlyphIndex > 0 || sourceGlyphIndex === 0) ? targetFont.glyphs.get(sourceGlyphIndex) : null;
+          } catch (e) {
+            sourceGlyph = null;
+          }
+          const scale = targetUnitsPerEm / (targetFont.unitsPerEm || 1000);
+          
+          let newGlyph = null;
+          if (!targetFont.precompiledCache) targetFont.precompiledCache = new Map();
+          if (sourceGlyphIndex > 0 && targetFont.precompiledCache.has(sourceGlyphIndex)) {
+            const cached = targetFont.precompiledCache.get(sourceGlyphIndex);
+            newGlyph = new opentype.Glyph({
+              name: cp === 0 ? '.null' : (sourceGlyph?.name || `uni${cp.toString(16).toUpperCase()}`),
+              unicode: cp,
+              advanceWidth: cached.advanceWidth,
+              path: new opentype.Path()
+            });
+            newGlyph._cachedMetrics = cached.metrics;
+            newGlyph._rawCharString = cached.rawCharString;
+          } else {
+            let scaledPath = new opentype.Path();
+            if (sourceGlyph) {
+              try {
+                let p = null;
+                if (typeof sourceGlyph.getPath === 'function') {
+                  p = sourceGlyph.getPath();
+                } else if (typeof sourceGlyph.path === 'function') {
+                  p = sourceGlyph.path();
+                } else if (sourceGlyph.path) {
+                  p = sourceGlyph.path;
+                }
+                scaledPath = scalePath(p, scale, isCFF);
+              } catch (e) {
+                scaledPath = new opentype.Path();
+              }
+            }
+            let advanceW = 0;
+            try {
+              advanceW = sourceGlyph ? Math.round((sourceGlyph.advanceWidth || 0) * scale) : 0;
+            } catch (e) {}
+
+            const isCaretCp = cp === 0x005E || cp === 0x02C6 || cp === 0x2038 || cp === 0x2041 || cp === 0x2303;
+            if (isCaretCp) {
+              const norm = normalizeCaretPath(scaledPath, advanceW, targetUnitsPerEm);
+              scaledPath = norm.path;
+              advanceW = norm.advanceWidth;
+            } else if (cp === 0x0640 && (!scaledPath || !scaledPath.commands || scaledPath.commands.length === 0)) {
+              const fixedTatweel = generateFixedTatweelGlyph(targetUnitsPerEm);
+              scaledPath = fixedTatweel.path;
+              advanceW = fixedTatweel.advanceWidth;
+            } else if (cp === 0x0338) {
+              const norm = normalizeCombiningOverlayPath(scaledPath, advanceW, targetUnitsPerEm);
+              scaledPath = norm.path;
+              advanceW = 0;
+            } else if (cp >= 0x1BC00 && cp <= 0x1BCA3 && (!scaledPath || !scaledPath.commands || scaledPath.commands.length === 0)) {
+              const fallbackFont = getDuployanFallbackFont();
+              if (fallbackFont) {
+                try {
+                  const fg = fallbackFont.charToGlyph(String.fromCodePoint(cp));
+                  if (fg) {
+                    let fgPath = null;
+                    if (typeof fg.getPath === 'function') fgPath = fg.getPath();
+                    else if (typeof fg.path === 'function') fgPath = fg.path();
+                    else fgPath = fg.path;
+                    if (fgPath && fgPath.commands && fgPath.commands.length > 0) {
+                      const fScale = targetUnitsPerEm / (fallbackFont.unitsPerEm || 1000);
+                      scaledPath = scalePath(fgPath, fScale, isCFF);
+                      advanceW = Math.round((fg.advanceWidth || 0) * fScale);
+                    }
+                  }
+                } catch (e) {}
+              }
+            }
+            const tempGlyph = new opentype.Glyph({
+              name: cp === 0 ? '.null' : (sourceGlyph?.name || `uni${cp.toString(16).toUpperCase()}`),
+              unicode: cp,
+              advanceWidth: advanceW,
+              path: scaledPath
+            });
+            let metrics = { xMin: 0, yMin: 0, xMax: 0, yMax: 0, leftSideBearing: 0, rightSideBearing: advanceW };
+            try {
+              metrics = tempGlyph.getMetrics();
+            } catch (e) {}
+            let rawCharString = null;
+            try {
+              const ops = opentype._glyphToOps(tempGlyph, 1);
+              rawCharString = opentype._encodeCHARSTRING(ops);
+            } catch (e) {}
+            
+            targetFont.precompiledCache.set(sourceGlyphIndex, {
+              metrics,
+              advanceWidth: tempGlyph.advanceWidth,
+              rawCharString
+            });
+            
+            newGlyph = tempGlyph;
+            newGlyph._cachedMetrics = metrics;
+            newGlyph._rawCharString = rawCharString;
+            newGlyph.path.commands = [];
+          }
+          
+          let replaceExisting = false;
+          if (baseGlyphIndex > 0) {
+              replaceExisting = true;
+          }
+
+          if (replaceExisting) {
+            let oldGlyph = null;
+            try {
+              oldGlyph = baseFontParsed.glyphs.get(baseGlyphIndex);
+            } catch (e) {}
+            let onlyUsedByCp = false;
+            if (!oldGlyph || !oldGlyph.unicodes || oldGlyph.unicodes.length <= 1) onlyUsedByCp = true;
+            
+            if (onlyUsedByCp) {
+              newGlyph.index = baseGlyphIndex;
+              baseFontParsed.glyphs.glyphs[baseGlyphIndex] = newGlyph;
+            } else {
+              if (oldGlyph && oldGlyph.unicodes) {
+                oldGlyph.unicodes = oldGlyph.unicodes.filter((u) => u !== cp);
+              }
+              if (oldGlyph && oldGlyph.unicode === cp) {
+                oldGlyph.unicode = oldGlyph.unicodes && oldGlyph.unicodes.length > 0 ? oldGlyph.unicodes[0] : undefined;
+              }
+              if (baseFontParsed.glyphs.length < 65535) {
+                newGlyph.index = baseFontParsed.glyphs.length;
+                baseFontParsed.glyphs.glyphs[baseFontParsed.glyphs.length] = newGlyph;
+                baseFontParsed.glyphs.length++;
+              } else {
+                hitLimit = true;
+              }
+            }
+          } else {
+            if (baseFontParsed.glyphs.length < 65535) {
+              newGlyph.index = baseFontParsed.glyphs.length;
+              baseFontParsed.glyphs.glyphs[baseFontParsed.glyphs.length] = newGlyph;
+              baseFontParsed.glyphs.length++;
+            } else {
+              hitLimit = true;
+            }
+          }
+          
+          processed++;
+          if (processed % 500 === 0) {
+            if (typeof global.gc === 'function') global.gc();
+            const mem = process.memoryUsage();
+            process.send({ type: 'progress', message: `Fused ${processed} / ${mappedCodepoints.size} (Mem: ${Math.round(mem.heapUsed/1024/1024)}MB)` });
+          }
+        } catch (cpErr) {
+          console.warn(`[Worker] Error fusing codepoint U+${cp.toString(16).toUpperCase()}:`, cpErr.message);
+          missingCount++;
         }
-        if (oldGlyph.unicode === cp) {
-          oldGlyph.unicode = oldGlyph.unicodes && oldGlyph.unicodes.length > 0 ? oldGlyph.unicodes[0] : undefined;
-        }
-        if (baseFontParsed.glyphs.length < 65535) {
-          newGlyph.index = baseFontParsed.glyphs.length;
-          baseFontParsed.glyphs.glyphs[baseFontParsed.glyphs.length] = newGlyph;
-          baseFontParsed.glyphs.length++;
-        } else {
-          hitLimit = true;
-        }
-      }
-    } else {
-      if (baseFontParsed.glyphs.length < 65535) {
-        newGlyph.index = baseFontParsed.glyphs.length;
-        baseFontParsed.glyphs.glyphs[baseFontParsed.glyphs.length] = newGlyph;
-        baseFontParsed.glyphs.length++;
-      } else {
-        hitLimit = true;
-      }
-    }
-    
-    processed++;
-    if (processed % 500 === 0) {
-      if (typeof global.gc === 'function') global.gc();
-      const mem = process.memoryUsage();
-      process.send({ type: 'progress', message: `Fused ${processed} / ${mappedCodepoints.size} (Mem: ${Math.round(mem.heapUsed/1024/1024)}MB)` });
-    }
-    } // End of cp loop
+      } // End of cp loop
     if (targetFont) targetFont.precompiledCache = null;
     parsedFontsCache.clear();
     if (typeof global.gc === 'function') global.gc();
@@ -575,76 +721,119 @@ try {
 
   
   // 1. Ensure Glyph 0 is strictly .notdef and unmapped in cmap
-  if (baseFontParsed.glyphs && baseFontParsed.glyphs.length > 0) {
-    const g0 = baseFontParsed.glyphs.get(0);
-    if (g0) {
-      g0.name = '.notdef';
-      g0.unicode = undefined;
-      g0.unicodes = [];
-      if (!g0.path || !g0.path.commands || g0.path.commands.length === 0) {
-        const notdefP = new opentype.Path();
-        notdefP.moveTo(80, 0); notdefP.lineTo(520, 0); notdefP.lineTo(520, 750); notdefP.lineTo(80, 750); notdefP.close();
-        notdefP.moveTo(140, 60); notdefP.lineTo(140, 690); notdefP.lineTo(460, 690); notdefP.lineTo(460, 60); notdefP.close();
-        g0.path = notdefP;
-        g0.advanceWidth = 600;
+  try {
+    if (baseFontParsed.glyphs && baseFontParsed.glyphs.length > 0) {
+      const g0 = baseFontParsed.glyphs.get(0);
+      if (g0) {
+        g0.name = '.notdef';
+        g0.unicode = undefined;
+        g0.unicodes = [];
+        let p0 = null;
+        try {
+          p0 = typeof g0.getPath === 'function' ? g0.getPath() : (typeof g0.path === 'function' ? g0.path() : g0.path);
+        } catch (e) {}
+        if (!p0 || !p0.commands || p0.commands.length === 0) {
+          const notdefP = new opentype.Path();
+          notdefP.moveTo(80, 0); notdefP.lineTo(520, 0); notdefP.lineTo(520, 750); notdefP.lineTo(80, 750); notdefP.close();
+          notdefP.moveTo(140, 60); notdefP.lineTo(140, 690); notdefP.lineTo(460, 690); notdefP.lineTo(460, 60); notdefP.close();
+          g0.path = notdefP;
+          g0.advanceWidth = 600;
+        }
       }
     }
-  }
+  } catch (e) {}
 
   // 2. Ensure Space (Unicode 32, 0x0020) exists (Windows strictly requires space glyph)
-  if (baseFontParsed.charToGlyphIndex(' ') <= 0) {
-    const spaceGlyph = new opentype.Glyph({
-      name: 'space',
-      unicode: 32,
-      advanceWidth: Math.round(targetUnitsPerEm * 0.25),
-      path: new opentype.Path()
-    });
-    if (baseFontParsed.glyphs.length < 65535) {
-      baseFontParsed.glyphs.glyphs[baseFontParsed.glyphs.length] = spaceGlyph;
-      baseFontParsed.glyphs.length++;
+  try {
+    if (baseFontParsed.charToGlyphIndex(' ') <= 0) {
+      const spaceGlyph = new opentype.Glyph({
+        name: 'space',
+        unicode: 32,
+        advanceWidth: Math.round(targetUnitsPerEm * 0.25),
+        path: new opentype.Path()
+      });
+      if (baseFontParsed.glyphs.length < 65535) {
+        baseFontParsed.glyphs.glyphs[baseFontParsed.glyphs.length] = spaceGlyph;
+        baseFontParsed.glyphs.length++;
+      }
     }
-  }
+  } catch (e) {}
 
   // 3. Clean and synchronize Name Table for 100% Windows installation compliance
-  const familyName = 'FusedFont';
-  const styleName = 'Regular';
-  const fullName = 'FusedFont Regular';
-  const postScriptName = 'FusedFont-Regular';
-  const uniqueID = `1.000;NONE;${postScriptName}`;
-  const versionString = 'Version 1.000';
+  try {
+    const familyName = 'FusedFont';
+    const styleName = 'Regular';
+    const fullName = 'FusedFont Regular';
+    const postScriptName = 'FusedFont-Regular';
+    const uniqueID = `1.000;NONE;${postScriptName}`;
+    const versionString = 'Version 1.000';
 
-  baseFontParsed.names = {
-    windows: {
-      fontFamily: { en: familyName },
-      fontSubfamily: { en: styleName },
-      uniqueID: { en: uniqueID },
-      fullName: { en: fullName },
-      version: { en: versionString },
-      postScriptName: { en: postScriptName },
-      description: { en: 'Fused by AI Studio' }
-    },
-    macintosh: {
-      fontFamily: { en: familyName },
-      fontSubfamily: { en: styleName },
-      uniqueID: { en: uniqueID },
-      fullName: { en: fullName },
-      version: { en: versionString },
-      postScriptName: { en: postScriptName },
-      description: { en: 'Fused by AI Studio' }
-    }
-  };
+    baseFontParsed.names = {
+      windows: {
+        fontFamily: { en: familyName },
+        fontSubfamily: { en: styleName },
+        uniqueID: { en: uniqueID },
+        fullName: { en: fullName },
+        version: { en: versionString },
+        postScriptName: { en: postScriptName },
+        description: { en: 'Fused by AI Studio' }
+      },
+      macintosh: {
+        fontFamily: { en: familyName },
+        fontSubfamily: { en: styleName },
+        uniqueID: { en: uniqueID },
+        fullName: { en: fullName },
+        version: { en: versionString },
+        postScriptName: { en: postScriptName },
+        description: { en: 'Fused by AI Studio' }
+      }
+    };
+  } catch (e) {}
   
   // Normalize any caret glyphs (0x005E, 0x02C6, 0x2038, 0x2041, 0x2303) in baseFontParsed
-  const caretCodepoints = [0x005E, 0x02C6, 0x2038, 0x2041, 0x2303];
-  for (const cCode of caretCodepoints) {
-    const cIdx = baseFontParsed.charToGlyphIndex(String.fromCodePoint(cCode));
-    if (cIdx && cIdx > 0) {
-      const g = baseFontParsed.glyphs.get(cIdx);
-      if (g && g.path && g.path.commands && g.path.commands.length > 0) {
-        const norm = normalizeCaretPath(g.path, g.advanceWidth || 0, targetUnitsPerEm);
-        if (norm.path !== g.path) {
-          g.path = norm.path;
-          g.advanceWidth = norm.advanceWidth;
+  try {
+    const caretCodepoints = [0x005E, 0x02C6, 0x2038, 0x2041, 0x2303];
+    for (const cCode of caretCodepoints) {
+      const cIdx = baseFontParsed.charToGlyphIndex(String.fromCodePoint(cCode));
+      if (cIdx && cIdx > 0) {
+        const g = baseFontParsed.glyphs.get(cIdx);
+        if (g) {
+          let gPath = null;
+          try {
+            gPath = typeof g.getPath === 'function' ? g.getPath() : (typeof g.path === 'function' ? g.path() : g.path);
+          } catch (e) {}
+          if (gPath && gPath.commands && gPath.commands.length > 0) {
+            const norm = normalizeCaretPath(gPath, g.advanceWidth || 0, targetUnitsPerEm);
+            if (norm.path !== gPath) {
+              g.path = norm.path;
+              g.advanceWidth = norm.advanceWidth;
+              g._cachedMetrics = null;
+              g._rawCharString = null;
+              try {
+                const ops = opentype._glyphToOps(g, 1);
+                g._rawCharString = opentype._encodeCHARSTRING(ops);
+              } catch (e) {}
+            }
+          }
+        }
+      }
+    }
+  } catch (e) {}
+
+  // Ensure Arabic Tatweel (U+0640) has a proper fixed baseline connecting elongation
+  try {
+    const tatweelIdx = baseFontParsed.charToGlyphIndex(String.fromCodePoint(0x0640));
+    if (tatweelIdx && tatweelIdx > 0) {
+      const g = baseFontParsed.glyphs.get(tatweelIdx);
+      if (g) {
+        let gPath = null;
+        try {
+          gPath = typeof g.getPath === 'function' ? g.getPath() : (typeof g.path === 'function' ? g.path() : g.path);
+        } catch (e) {}
+        if (!gPath || !gPath.commands || gPath.commands.length === 0) {
+          const fixedTatweel = generateFixedTatweelGlyph(targetUnitsPerEm);
+          g.path = fixedTatweel.path;
+          g.advanceWidth = fixedTatweel.advanceWidth;
           g._cachedMetrics = null;
           g._rawCharString = null;
           try {
@@ -654,127 +843,145 @@ try {
         }
       }
     }
-  }
+  } catch (e) {}
 
-  // Ensure Arabic Tatweel (U+0640) has a proper fixed baseline connecting elongation
-  const tatweelIdx = baseFontParsed.charToGlyphIndex(String.fromCodePoint(0x0640));
-  if (tatweelIdx && tatweelIdx > 0) {
-    const g = baseFontParsed.glyphs.get(tatweelIdx);
-    if (!g || !g.path || !g.path.commands || g.path.commands.length === 0) {
-      const fixedTatweel = generateFixedTatweelGlyph(targetUnitsPerEm);
-      g.path = fixedTatweel.path;
-      g.advanceWidth = fixedTatweel.advanceWidth;
-      g._cachedMetrics = null;
-      g._rawCharString = null;
+  // Ensure U+0338 (Combining Long Solidus Overlay) exists with strictly 0 advanceWidth and centered overlay positioning
+  try {
+    const solidusIdx = baseFontParsed.charToGlyphIndex(String.fromCodePoint(0x0338));
+    if (!solidusIdx || solidusIdx <= 0) {
+      const fixedSolidus = generateCombiningLongSolidusOverlay(targetUnitsPerEm);
+      const g = new opentype.Glyph({
+        name: 'uni0338',
+        unicode: 0x0338,
+        advanceWidth: 0,
+        path: fixedSolidus.path
+      });
       try {
         const ops = opentype._glyphToOps(g, 1);
         g._rawCharString = opentype._encodeCHARSTRING(ops);
-      } catch (e) {}
-    }
-  }
-
-  // Ensure U+0338 (Combining Long Solidus Overlay) exists with strictly 0 advanceWidth and centered overlay positioning
-  const solidusIdx = baseFontParsed.charToGlyphIndex(String.fromCodePoint(0x0338));
-  if (!solidusIdx || solidusIdx <= 0) {
-    const fixedSolidus = generateCombiningLongSolidusOverlay(targetUnitsPerEm);
-    const g = new opentype.Glyph({
-      name: 'uni0338',
-      unicode: 0x0338,
-      advanceWidth: 0,
-      path: fixedSolidus.path
-    });
-    try {
-      const ops = opentype._glyphToOps(g, 1);
-      g._rawCharString = opentype._encodeCHARSTRING(ops);
-    } catch(e) {}
-    if (baseFontParsed.glyphs.length < 65535) {
-      g.index = baseFontParsed.glyphs.length;
-      baseFontParsed.glyphs.glyphs[baseFontParsed.glyphs.length] = g;
-      baseFontParsed.glyphs.length++;
-    }
-  } else {
-    const g = baseFontParsed.glyphs.get(solidusIdx);
-    const norm = normalizeCombiningOverlayPath(g.path, g.advanceWidth, targetUnitsPerEm);
-    g.path = norm.path;
-    g.advanceWidth = 0;
-    g._cachedMetrics = null;
-    g._rawCharString = null;
-    try {
-      const ops = opentype._glyphToOps(g, 1);
-      g._rawCharString = opentype._encodeCHARSTRING(ops);
-    } catch (e) {}
-  }
-
-  // Ensure negated math symbols (⊄, ⊈, ≠, etc.) and their base symbols are paired properly
-  for (const [negStr, baseStr] of Object.entries(NEGATED_MATH_MAP)) {
-    const negCp = Number(negStr);
-    const baseCp = Number(baseStr);
-    const baseIdx = baseFontParsed.charToGlyphIndex(String.fromCodePoint(baseCp));
-    const negIdx = baseFontParsed.charToGlyphIndex(String.fromCodePoint(negCp));
-    
-    // If base exists, but negated doesn't: synthesize negated glyph
-    if (baseIdx > 0 && (!negIdx || negIdx <= 0)) {
-      const baseG = baseFontParsed.glyphs.get(baseIdx);
-      if (baseG && baseG.path && baseG.path.commands && baseG.path.commands.length > 0) {
-        const advW = baseG.advanceWidth || Math.round(targetUnitsPerEm * 0.6);
-        const p = new opentype.Path();
-        for (const cmd of baseG.path.commands) {
-          p.commands.push({ ...cmd });
-        }
-        const halfThick = Math.round(targetUnitsPerEm * 0.028);
-        const x1 = Math.round(advW - targetUnitsPerEm * 0.52);
-        const y1 = Math.round(-targetUnitsPerEm * 0.08);
-        const x2 = Math.round(advW - targetUnitsPerEm * 0.08);
-        const y2 = Math.round(+targetUnitsPerEm * 0.72);
-        p.moveTo(x1 - halfThick, y1);
-        p.lineTo(x2 - halfThick, y2);
-        p.lineTo(x2 + halfThick, y2);
-        p.lineTo(x1 + halfThick, y1);
-        p.close();
-
-        const synthGlyph = new opentype.Glyph({
-          name: `uni${negCp.toString(16).toUpperCase()}`,
-          unicode: negCp,
-          advanceWidth: advW,
-          path: p
-        });
+      } catch(e) {}
+      if (baseFontParsed.glyphs.length < 65535) {
+        g.index = baseFontParsed.glyphs.length;
+        baseFontParsed.glyphs.glyphs[baseFontParsed.glyphs.length] = g;
+        baseFontParsed.glyphs.length++;
+      }
+    } else {
+      const g = baseFontParsed.glyphs.get(solidusIdx);
+      if (g) {
+        let gPath = null;
         try {
-          const ops = opentype._glyphToOps(synthGlyph, 1);
-          synthGlyph._rawCharString = opentype._encodeCHARSTRING(ops);
-        } catch(e) {}
-        if (baseFontParsed.glyphs.length < 65535) {
-          synthGlyph.index = baseFontParsed.glyphs.length;
-          baseFontParsed.glyphs.glyphs[baseFontParsed.glyphs.length] = synthGlyph;
-          baseFontParsed.glyphs.length++;
-        }
+          gPath = typeof g.getPath === 'function' ? g.getPath() : (typeof g.path === 'function' ? g.path() : g.path);
+        } catch (e) {}
+        const norm = normalizeCombiningOverlayPath(gPath, g.advanceWidth, targetUnitsPerEm);
+        g.path = norm.path;
+        g.advanceWidth = 0;
+        g._cachedMetrics = null;
+        g._rawCharString = null;
+        try {
+          const ops = opentype._glyphToOps(g, 1);
+          g._rawCharString = opentype._encodeCHARSTRING(ops);
+        } catch (e) {}
       }
     }
-  }
+  } catch (e) {}
 
-  // Ensure any Duployan glyphs present in baseFontParsed have visible outlines
-  for (let cp = 0x1BC00; cp <= 0x1BCA3; cp++) {
-    const idx = baseFontParsed.charToGlyphIndex(String.fromCodePoint(cp));
-    if (idx > 0) {
-      const g = baseFontParsed.glyphs.get(idx);
-      if (!g || !g.path || !g.path.commands || g.path.commands.length === 0) {
-        const fallbackFont = getDuployanFallbackFont();
-        if (fallbackFont) {
-          const fg = fallbackFont.charToGlyph(String.fromCodePoint(cp));
-          if (fg && fg.path && fg.path.commands && fg.path.commands.length > 0) {
-            const fScale = targetUnitsPerEm / fallbackFont.unitsPerEm;
-            g.path = scalePath(fg.path, fScale, isCFF);
-            g.advanceWidth = Math.round((fg.advanceWidth || 0) * fScale);
-            g._cachedMetrics = null;
-            g._rawCharString = null;
+  // Ensure negated math symbols (⊄, ⊈, ≠, etc.) and their base symbols are paired properly
+  try {
+    for (const [negStr, baseStr] of Object.entries(NEGATED_MATH_MAP)) {
+      const negCp = Number(negStr);
+      const baseCp = Number(baseStr);
+      const baseIdx = baseFontParsed.charToGlyphIndex(String.fromCodePoint(baseCp));
+      const negIdx = baseFontParsed.charToGlyphIndex(String.fromCodePoint(negCp));
+      
+      // If base exists, but negated doesn't: synthesize negated glyph
+      if (baseIdx > 0 && (!negIdx || negIdx <= 0)) {
+        const baseG = baseFontParsed.glyphs.get(baseIdx);
+        if (baseG) {
+          let bgPath = null;
+          try {
+            bgPath = typeof baseG.getPath === 'function' ? baseG.getPath() : (typeof baseG.path === 'function' ? baseG.path() : baseG.path);
+          } catch (e) {}
+          if (bgPath && bgPath.commands && bgPath.commands.length > 0) {
+            const advW = baseG.advanceWidth || Math.round(targetUnitsPerEm * 0.6);
+            const p = new opentype.Path();
+            for (const cmd of bgPath.commands) {
+              p.commands.push({ ...cmd });
+            }
+            const halfThick = Math.round(targetUnitsPerEm * 0.028);
+            const x1 = Math.round(advW - targetUnitsPerEm * 0.52);
+            const y1 = Math.round(-targetUnitsPerEm * 0.08);
+            const x2 = Math.round(advW - targetUnitsPerEm * 0.08);
+            const y2 = Math.round(+targetUnitsPerEm * 0.72);
+            p.moveTo(x1 - halfThick, y1);
+            p.lineTo(x2 - halfThick, y2);
+            p.lineTo(x2 + halfThick, y2);
+            p.lineTo(x1 + halfThick, y1);
+            p.close();
+
+            const synthGlyph = new opentype.Glyph({
+              name: `uni${negCp.toString(16).toUpperCase()}`,
+              unicode: negCp,
+              advanceWidth: advW,
+              path: p
+            });
+            try {
+              const ops = opentype._glyphToOps(synthGlyph, 1);
+              synthGlyph._rawCharString = opentype._encodeCHARSTRING(ops);
+            } catch(e) {}
+            if (baseFontParsed.glyphs.length < 65535) {
+              synthGlyph.index = baseFontParsed.glyphs.length;
+              baseFontParsed.glyphs.glyphs[baseFontParsed.glyphs.length] = synthGlyph;
+              baseFontParsed.glyphs.length++;
+            }
           }
         }
       }
     }
-  }
+  } catch (e) {}
+
+  // Ensure any Duployan glyphs present in baseFontParsed have visible outlines
+  try {
+    for (let cp = 0x1BC00; cp <= 0x1BCA3; cp++) {
+      const idx = baseFontParsed.charToGlyphIndex(String.fromCodePoint(cp));
+      if (idx > 0) {
+        const g = baseFontParsed.glyphs.get(idx);
+        if (g) {
+          let gPath = null;
+          try {
+            gPath = typeof g.getPath === 'function' ? g.getPath() : (typeof g.path === 'function' ? g.path() : g.path);
+          } catch (e) {}
+          if (!gPath || !gPath.commands || gPath.commands.length === 0) {
+            const fallbackFont = getDuployanFallbackFont();
+            if (fallbackFont) {
+              const fg = fallbackFont.charToGlyph(String.fromCodePoint(cp));
+              if (fg) {
+                let fgPath = null;
+                try {
+                  fgPath = typeof fg.getPath === 'function' ? fg.getPath() : (typeof fg.path === 'function' ? fg.path() : fg.path);
+                } catch (e) {}
+                if (fgPath && fgPath.commands && fgPath.commands.length > 0) {
+                  const fScale = targetUnitsPerEm / (fallbackFont.unitsPerEm || 1000);
+                  g.path = scalePath(fgPath, fScale, isCFF);
+                  g.advanceWidth = Math.round((fg.advanceWidth || 0) * fScale);
+                  g._cachedMetrics = null;
+                  g._rawCharString = null;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  } catch (e) {}
 
   // 4. Sanitize every glyph in baseFontParsed for strict CFF and Windows validation
   for (let i = 0; i < baseFontParsed.glyphs.length; i++) {
-    const g = baseFontParsed.glyphs.get(i);
+    let g = null;
+    try {
+      g = baseFontParsed.glyphs.get(i);
+    } catch (e) {
+      continue;
+    }
     if (!g) continue;
     if (i === 0) {
       g.name = '.notdef';
@@ -787,11 +994,19 @@ try {
       }
     }
 
-    if (typeof g.path === 'function') {
-      try { g.path = g.path(); } catch(e) { g.path = new opentype.Path(); }
+    let glyphPath = null;
+    try {
+      if (typeof g.getPath === 'function') {
+        glyphPath = g.getPath();
+      } else if (typeof g.path === 'function') {
+        glyphPath = g.path();
+      } else if (g.path) {
+        glyphPath = g.path;
+      }
+    } catch (e) {
+      glyphPath = new opentype.Path();
     }
-    if (!g.path) g.path = new opentype.Path();
-    if (!Array.isArray(g.path.commands)) g.path.commands = [];
+    g.path = (glyphPath && Array.isArray(glyphPath.commands)) ? glyphPath : new opentype.Path();
 
     let hasInvalidCoord = false;
     for (const cmd of g.path.commands) {
@@ -816,7 +1031,9 @@ try {
           { name: "width", type: "NUMBER", value: g.advanceWidth || 500 },
           { name: "endchar", type: "OP", value: 14 }
         ];
-        g._rawCharString = opentype._encodeCHARSTRING(emptyOps);
+        try {
+          g._rawCharString = opentype._encodeCHARSTRING(emptyOps);
+        } catch (e2) {}
       }
     }
   }

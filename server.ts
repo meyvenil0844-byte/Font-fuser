@@ -8,6 +8,7 @@ import zlib from 'zlib';
 import opentype from 'opentype.js';
 import { createServer as createViteServer } from 'vite';
 import { injectApplyPolyfill } from './src/lib/applyPolyfill.ts';
+import './src/lib/dataViewPolyfill.ts';
 
 process.on('uncaughtException', (err) => {
   console.error('Server process uncaughtException caught:', err);
@@ -828,7 +829,7 @@ app.post('/api/fuse-by-ids', async (req, res) => {
         console.log("Worker done. Saving job:", jobId);
         activeJobs.set(jobId, { status: 'done', file: msg.file, originalName: msg.originalName, serverFontIds });
       } else if (msg.type === 'error') {
-        console.error("Worker error:", msg.message);
+        console.error("Worker error:", msg.message, msg.stack || '');
         activeJobs.set(jobId, { status: 'error', message: msg.message });
         try {
           if (serverFontIds) {

@@ -1,3 +1,4 @@
+import './dataViewPolyfill';
 import * as opentype from 'opentype.js';
 import type { UploadedFont, GlyphMapping } from '../types';
 import { buildSvgTable, buildCpalTable, buildCaplTable, buildColrTable, extractColorFontInfo, wrapGlyphSvg } from './colorFontUtils';
