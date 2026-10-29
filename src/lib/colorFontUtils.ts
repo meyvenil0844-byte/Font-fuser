@@ -75,8 +75,6 @@ export function colorToBgraInt(colorStr: string): number {
     }
   }
   
-  // CPAL stores ColorRecord: byte 0 = blue, byte 1 = green, byte 2 = red, byte 3 = alpha
-  // Opentype.js writes ULONG big-endian: (blue << 24) | (green << 16) | (red << 8) | alpha
   return (((b & 0xFF) << 24) | ((g & 0xFF) << 16) | ((r & 0xFF) << 8) | (a & 0xFF)) >>> 0;
 }
 
@@ -85,13 +83,6 @@ export function colorToBgraInt(colorStr: string): number {
  * into a hex color string #RRGGBB or #RRGGBBAA
  */
 export function bgraIntToHex(bgra: number): string {
-  // In OpenType CPAL specification, ColorRecord is:
-  // byte 0: blue, byte 1: green, byte 2: red, byte 3: alpha
-  // When opentype.js reads this as a big-endian ULong:
-  // bits 24..31: blue
-  // bits 16..23: green
-  // bits 8..15:  red
-  // bits 0..7:   alpha
   const b = (bgra >>> 24) & 0xFF;
   const g = (bgra >>> 16) & 0xFF;
   const r = (bgra >>> 8) & 0xFF;
@@ -143,7 +134,6 @@ export const buildCaplTable = buildCpalTable;
  * Builds OpenType COLR (Color Layers) Table Structure
  */
 export function buildColrTable(baseGlyphs: { glyphID: number; layers: { glyphID: number; paletteIndex: number }[] }[]): any {
-  // OpenType COLR requirement: baseGlyphRecords MUST be sorted by glyphID in ascending order
   const sortedBases = [...baseGlyphs].sort((a, b) => a.glyphID - b.glyphID);
   
   const baseGlyphRecords: { glyphID: number; firstLayerIndex: number; numLayers: number }[] = [];
@@ -183,7 +173,6 @@ export function buildSvgTable(svgEntries: { glyphID: number; svg: string | Uint8
     let bytes: Uint8Array;
     if (typeof entry.svg === 'string') {
       let doc = entry.svg.trim();
-      // Ensure valid <svg> root with id matching glyph ID
       if (!doc.includes(`id="glyph${entry.glyphID}"`)) {
         doc = doc.replace(/<svg\b([^>]*)>/i, `<svg$1 id="glyph${entry.glyphID}">`);
       }
@@ -197,10 +186,27 @@ export function buildSvgTable(svgEntries: { glyphID: number; svg: string | Uint8
   return map;
 }
 
+export function createEmptyColorData(): ColorFontData {
+  return {
+    hasColor: false,
+    hasCOLR: false,
+    hasCPAL: false,
+    hasCAPL: false,
+    hasSVG: false,
+    palettes: [],
+    colorGlyphs: new Map(),
+    codepointColorMap: new Map()
+  };
+}
+
 /**
  * Extracts and inspects all Color OpenType tables (SVG in OpenType, COLR, CPAL, CAPL) from an opentype.Font
  */
 export function extractColorFontInfo(font: any): ColorFontData {
+  if (font && font._cachedColorInfo) {
+    return font._cachedColorInfo;
+  }
+
   const result: ColorFontData = {
     hasColor: false,
     hasCOLR: false,
@@ -211,9 +217,9 @@ export function extractColorFontInfo(font: any): ColorFontData {
     colorGlyphs: new Map(),
     codepointColorMap: new Map()
   };
-  
+
   if (!font) return result;
-  
+
   // 1. Inspect CPAL / CAPL (Color Palette)
   const cpal = font.tables?.cpal || font.tables?.CPAL || font.tables?.capl || font.tables?.CAPL;
   if (cpal && cpal.colorRecords && cpal.colorRecords.length > 0) {
@@ -221,7 +227,7 @@ export function extractColorFontInfo(font: any): ColorFontData {
     result.hasCAPL = true;
     const numEntries = cpal.numPaletteEntries || cpal.colorRecords.length;
     const numPalettes = cpal.colorRecordIndices ? cpal.colorRecordIndices.length : 1;
-    
+
     for (let p = 0; p < numPalettes; p++) {
       const paletteColors: string[] = [];
       const startIndex = cpal.colorRecordIndices ? cpal.colorRecordIndices[p] : (p * numEntries);
@@ -232,7 +238,7 @@ export function extractColorFontInfo(font: any): ColorFontData {
       result.palettes.push(paletteColors);
     }
   }
-  
+
   // 2. Inspect COLR (Color Layers - COLRv0 compatible)
   const colr = font.tables?.colr || font.tables?.COLR;
   if (colr && Array.isArray(colr.baseGlyphRecords) && colr.baseGlyphRecords.length > 0 && Array.isArray(colr.layerRecords)) {
@@ -240,20 +246,20 @@ export function extractColorFontInfo(font: any): ColorFontData {
     result.colrVersion = colr.version !== undefined ? colr.version : 0;
     result.isColrV0 = result.colrVersion === 0;
     const defaultPalette = result.palettes[0] || [];
-    
+
     for (const bg of colr.baseGlyphRecords) {
       if (!bg) continue;
       const gid = bg.glyphID;
       const layers: ColorLayer[] = [];
       const start = bg.firstLayerIndex || 0;
       const count = bg.numLayers || 0;
-      
+
       for (let i = 0; i < count; i++) {
         const lr = colr.layerRecords[start + i];
         if (lr) {
           const colorHex = lr.paletteIndex === 0xFFFF
             ? 'currentColor'
-            : (defaultPalette[lr.paletteIndex] || '#000000');
+            : (defaultPalette[lr.paletteIndex] || '#ff0000');
           layers.push({
             glyphIndex: lr.glyphID,
             paletteIndex: lr.paletteIndex,
@@ -261,7 +267,7 @@ export function extractColorFontInfo(font: any): ColorFontData {
           });
         }
       }
-      
+
       const record: ColorGlyphRecord = {
         glyphIndex: gid,
         layers,
@@ -272,7 +278,7 @@ export function extractColorFontInfo(font: any): ColorFontData {
       result.colorGlyphs.set(gid, record);
     }
   }
-  
+
   // 3. Inspect SVG in OpenType
   const svgTable = font.tables?.svg || font.tables?.SVG || font.tables?.['SVG '];
   if (svgTable) {
@@ -302,14 +308,13 @@ export function extractColorFontInfo(font: any): ColorFontData {
       }
     }
   }
-  
+
   result.hasColor = result.hasCOLR || result.hasCPAL || result.hasCAPL || result.hasSVG;
-  
-  // Map codepoints to color records efficiently (inspect only color glyph IDs, never decompile outlines)
+
+  // Map codepoints to color records efficiently using cmap without touching glyph outlines
   if (result.hasColor && result.colorGlyphs.size > 0) {
     const glyphIdToUnicode = new Map<number, number>();
-    
-    // Check main cmap and all cmap subtables (format 4 BMP and format 12 32-bit supplementary planes)
+
     const cmap = font.tables?.cmap;
     if (cmap) {
       if (cmap.glyphIndexMap && typeof cmap.glyphIndexMap === 'object') {
@@ -327,7 +332,6 @@ export function extractColorFontInfo(font: any): ColorFontData {
         }
       }
     }
-
     const encCmap = (font.encoding as any)?.cmap?.glyphIndexMap;
     if (encCmap && typeof encCmap === 'object') {
       for (const [uniStr, gid] of Object.entries(encCmap)) {
@@ -335,27 +339,15 @@ export function extractColorFontInfo(font: any): ColorFontData {
       }
     }
 
-    // Direct glyph unicode lookup if available without triggering outline parse
-    if (font.glyphs) {
-      const gLen = typeof font.glyphs.length === 'number' ? font.glyphs.length : 0;
-      for (let i = 0; i < gLen; i++) {
-        if (!glyphIdToUnicode.has(i)) {
-          const g = typeof font.glyphs.get === 'function' ? font.glyphs.get(i) : (font.glyphs.glyphs ? font.glyphs.glyphs[i] : null);
-          if (g && typeof g.unicode === 'number' && g.unicode > 0) {
-            glyphIdToUnicode.set(i, g.unicode);
-          }
-        }
-      }
-    }
-
-    // Assign codepoints instantly without triggering expensive glyph outline decompilations
     result.colorGlyphs.forEach((record, gid) => {
       let unicode = glyphIdToUnicode.get(gid);
-      if (unicode === undefined && font.glyphs) {
-        const g = typeof font.glyphs.get === 'function' ? font.glyphs.get(gid) : (font.glyphs.glyphs ? font.glyphs.glyphs[gid] : null);
-        if (g && typeof g.unicode === 'number' && g.unicode > 0) {
-          unicode = g.unicode;
-        }
+      if (unicode === undefined && font.glyphs?.glyphs) {
+        try {
+          const g = font.glyphs.glyphs[gid];
+          if (g && typeof g.unicode === 'number' && g.unicode > 0) {
+            unicode = g.unicode;
+          }
+        } catch (e) {}
       }
       if (unicode !== undefined) {
         record.codepoint = unicode;
@@ -363,7 +355,11 @@ export function extractColorFontInfo(font: any): ColorFontData {
       }
     });
   }
-  
+
+  try {
+    font._cachedColorInfo = result;
+  } catch (e) {}
+
   return result;
 }
 
@@ -391,12 +387,13 @@ export function wrapGlyphSvg(pathData: string, options: {
 
 /**
  * Merges Color Tables (SVG in OpenType, COLR, CPAL, and CAPL) across base font and mapped target fonts
+ * Ultra-low memory implementation: supports optional newGlyphs and prevents reading undefined.length.
  */
 export function mergeColorTables(
   baseFont: any,
-  parsedFonts: Map<string, any>,
+  parsedFonts: Map<string, any> | { get: (id: string) => any; forEach?: any },
   glyphMap: Record<number, string>,
-  newGlyphs: any[]
+  newGlyphs?: any[]
 ): {
   hasColor: boolean;
   colrTable: any | null;
@@ -404,19 +401,33 @@ export function mergeColorTables(
   caplTable: any | null;
   svgTable: Map<number, Uint8Array> | null;
 } {
-  const decoder = new TextDecoder('utf-8');
   const encoder = new TextEncoder();
-  
   const baseColorInfo = extractColorFontInfo(baseFont);
-  
-  // Check if any source font or base font has color
+
+  // Cache target font color data to prevent re-extracting in loops
+  const targetColorCache = new Map<string, ColorFontData>();
+  const getTargetColor = (fontId: string): ColorFontData | null => {
+    if (targetColorCache.has(fontId)) return targetColorCache.get(fontId)!;
+    const font = parsedFonts.get(fontId);
+    if (!font) return null;
+    const info = extractColorFontInfo(font);
+    targetColorCache.set(fontId, info);
+    return info;
+  };
+
+  // Check if any font in the mapping has color
   let anyFontHasColor = baseColorInfo.hasColor;
-  parsedFonts.forEach((font) => {
-    if (extractColorFontInfo(font).hasColor) {
-      anyFontHasColor = true;
+  if (!anyFontHasColor) {
+    const usedFontIds = new Set(Object.values(glyphMap || {}));
+    for (const fId of usedFontIds) {
+      const info = getTargetColor(fId);
+      if (info && info.hasColor) {
+        anyFontHasColor = true;
+        break;
+      }
     }
-  });
-  
+  }
+
   if (!anyFontHasColor) {
     return {
       hasColor: false,
@@ -426,11 +437,11 @@ export function mergeColorTables(
       svgTable: null
     };
   }
-  
+
   // 1. Consolidate Palettes (CPAL & CAPL)
   const masterPalette: string[] = [];
   const paletteIndexMap = new Map<string, number>(); // fontId:origIndex -> newIndex
-  
+
   // Copy base font palette 0
   if (baseColorInfo.palettes.length > 0) {
     for (let i = 0; i < baseColorInfo.palettes[0].length; i++) {
@@ -439,57 +450,50 @@ export function mergeColorTables(
       paletteIndexMap.set(`base:${i}`, i);
     }
   }
-  
+
   // Ensure default vibrant palette if empty
   if (masterPalette.length === 0) {
-    masterPalette.push('#000000', '#ffffff', '#3b82f6', '#ef4444', '#10b981', '#f59e0b', '#8b5cf6', '#ec4899');
+    masterPalette.push('#000000', '#ffffff', '#ff0000', '#3b82f6', '#ef4444', '#10b981', '#f59e0b', '#8b5cf6', '#ec4899');
   }
-  
+
   const getOrAddPaletteColor = (fontId: string, origIdx: number, colorHex: string): number => {
     if (origIdx === 0xFFFF) return 0xFFFF; // currentColor
     const key = `${fontId}:${origIdx}`;
     if (paletteIndexMap.has(key)) return paletteIndexMap.get(key)!;
-    
-    // Check if color is already in masterPalette
+
     const existing = masterPalette.indexOf(colorHex.toLowerCase());
     if (existing !== -1) {
       paletteIndexMap.set(key, existing);
       return existing;
     }
-    
+
     const newIdx = masterPalette.length;
     masterPalette.push(colorHex);
     paletteIndexMap.set(key, newIdx);
     return newIdx;
   };
-  
+
   // 2. Build Merged SVG in OpenType Table
   const mergedSvgMap = new Map<number, Uint8Array>();
-  
+
   // 3. Build Merged COLR Table
   const colrBaseGlyphMap = new Map<number, { glyphID: number; layers: { glyphID: number; paletteIndex: number }[] }>();
-  
-  // First, migrate base font color glyphs that were NOT swapped
-  for (let targetGid = 0; targetGid < newGlyphs.length; targetGid++) {
-    const g = newGlyphs[targetGid];
-    if (!g) continue;
-    const cp = g.unicode;
-    const isSwapped = cp !== undefined && glyphMap[cp] !== undefined;
-    
+
+  // A. Migrate base font color glyphs that were NOT swapped
+  baseColorInfo.colorGlyphs.forEach((baseColr, targetGid) => {
+    const cp = baseColr.codepoint;
+    const isSwapped = cp !== undefined && glyphMap && glyphMap[cp] !== undefined;
+
     if (!isSwapped) {
-      // Retain base font SVG
-      const baseSvg = baseColorInfo.colorGlyphs.get(targetGid)?.svgDocument;
-      if (baseSvg) {
-        let doc = baseSvg.replace(/id="glyph\d+"/g, `id="glyph${targetGid}"`);
+      if (baseColr.svgDocument) {
+        let doc = baseColr.svgDocument.replace(/id="glyph\d+"/g, `id="glyph${targetGid}"`);
         if (!doc.includes(`id="glyph${targetGid}"`)) {
           doc = doc.replace(/<svg\b([^>]*)>/i, `<svg$1 id="glyph${targetGid}">`);
         }
         mergedSvgMap.set(targetGid, encoder.encode(doc));
       }
-      
-      // Retain base font COLR
-      const baseColr = baseColorInfo.colorGlyphs.get(targetGid);
-      if (baseColr && baseColr.layers && baseColr.layers.length > 0) {
+
+      if (baseColr.layers && baseColr.layers.length > 0) {
         const remappedLayers: { glyphID: number; paletteIndex: number }[] = [];
         for (const l of baseColr.layers) {
           remappedLayers.push({
@@ -503,25 +507,96 @@ export function mergeColorTables(
         });
       }
     }
+  });
+
+  // Pre-index baseFont glyphs by unicode in a single pass (O(N)) to eliminate linear scans
+  const baseUnicodeToGid = new Map<number, number>();
+  if (Array.isArray(newGlyphs) && newGlyphs.length > 0) {
+    for (let i = 0; i < newGlyphs.length; i++) {
+      const g = newGlyphs[i];
+      if (g) {
+        if (typeof g.unicode === 'number') baseUnicodeToGid.set(g.unicode, i);
+        if (Array.isArray(g.unicodes)) {
+          for (const u of g.unicodes) baseUnicodeToGid.set(u, i);
+        }
+      }
+    }
+  } else if (baseFont) {
+    const cmap = baseFont.tables?.cmap?.glyphIndexMap || (baseFont.encoding as any)?.cmap?.glyphIndexMap;
+    if (cmap && typeof cmap === 'object') {
+      for (const [uStr, gid] of Object.entries(cmap)) {
+        baseUnicodeToGid.set(Number(uStr), Number(gid));
+      }
+    } else if (baseFont.glyphs?.glyphs) {
+      const gObj = baseFont.glyphs.glyphs;
+      const vals = Object.values(gObj);
+      for (let i = 0; i < vals.length; i++) {
+        const g: any = vals[i];
+        if (g) {
+          if (typeof g.unicode === 'number') baseUnicodeToGid.set(g.unicode, g.index ?? i);
+          if (Array.isArray(g.unicodes)) {
+            for (const u of g.unicodes) baseUnicodeToGid.set(u, g.index ?? i);
+          }
+        }
+      }
+    }
   }
-  
-  // Now, merge swapped glyphs from target fonts
-  for (let targetGid = 0; targetGid < newGlyphs.length; targetGid++) {
-    const g = newGlyphs[targetGid];
-    if (!g || g.unicode === undefined) continue;
-    const cp = g.unicode;
-    const targetFontId = glyphMap[cp];
+
+  // Pre-index target fonts
+  const targetUnicodeToGidMaps = new Map<string, Map<number, number>>();
+  const getTargetGidMap = (fId: string, font: any): Map<number, number> => {
+    if (targetUnicodeToGidMaps.has(fId)) return targetUnicodeToGidMaps.get(fId)!;
+    const m = new Map<number, number>();
+    if (font) {
+      const cmap = font.tables?.cmap?.glyphIndexMap || (font.encoding as any)?.cmap?.glyphIndexMap;
+      if (cmap && typeof cmap === 'object') {
+        for (const [uStr, gid] of Object.entries(cmap)) {
+          m.set(Number(uStr), Number(gid));
+        }
+      } else if (font.glyphs?.glyphs) {
+        const gObj = font.glyphs.glyphs;
+        const vals = Object.values(gObj);
+        for (let i = 0; i < vals.length; i++) {
+          const g: any = vals[i];
+          if (g) {
+            if (typeof g.unicode === 'number') m.set(g.unicode, g.index ?? i);
+            if (Array.isArray(g.unicodes)) {
+              for (const u of g.unicodes) m.set(u, g.index ?? i);
+            }
+          }
+        }
+      }
+    }
+    targetUnicodeToGidMaps.set(fId, m);
+    return m;
+  };
+
+  // B. Merge swapped glyphs from target fonts
+  for (const [cpStr, targetFontId] of Object.entries(glyphMap || {})) {
+    const cp = Number(cpStr);
     if (!targetFontId) continue;
-    
+
+    const targetColorInfo = getTargetColor(targetFontId);
+    if (!targetColorInfo || !targetColorInfo.hasColor) continue;
+
     const targetFont = parsedFonts.get(targetFontId);
     if (!targetFont) continue;
-    
-    const targetColorInfo = extractColorFontInfo(targetFont);
-    const sourceGid = targetFont.charToGlyphIndex(String.fromCodePoint(cp));
+
+    const targetGidMap = getTargetGidMap(targetFontId, targetFont);
+    const sourceGid = targetGidMap.get(cp) || (typeof targetFont.charToGlyphIndex === 'function' ? targetFont.charToGlyphIndex(String.fromCodePoint(cp)) : 0);
     if (!sourceGid || sourceGid <= 0) continue;
-    
-    // A. SVG in OpenType for swapped glyph
-    const sourceSvgDoc = targetColorInfo.colorGlyphs.get(sourceGid)?.svgDocument;
+
+    const sourceColr = targetColorInfo.colorGlyphs.get(sourceGid) || targetColorInfo.codepointColorMap.get(cp);
+    if (!sourceColr) continue;
+
+    let targetGid = baseUnicodeToGid.get(cp);
+    if (targetGid === undefined && typeof baseFont.charToGlyphIndex === 'function') {
+      targetGid = baseFont.charToGlyphIndex(String.fromCodePoint(cp));
+    }
+    if (targetGid === undefined || targetGid < 0) continue;
+
+    // SVG in OpenType for swapped glyph
+    const sourceSvgDoc = sourceColr.svgDocument;
     if (sourceSvgDoc) {
       let doc = sourceSvgDoc.replace(/id="glyph\d+"/g, `id="glyph${targetGid}"`);
       if (!doc.includes(`id="glyph${targetGid}"`)) {
@@ -529,94 +604,63 @@ export function mergeColorTables(
       }
       mergedSvgMap.set(targetGid, encoder.encode(doc));
     }
-    
-    // B. COLR for swapped glyph
-    const sourceColr = targetColorInfo.colorGlyphs.get(sourceGid);
-    if (sourceColr && sourceColr.layers && sourceColr.layers.length > 0) {
+
+    // COLR for swapped glyph
+    if (sourceColr.layers && sourceColr.layers.length > 0) {
       const remappedLayers: { glyphID: number; paletteIndex: number }[] = [];
       const targetPalette = targetColorInfo.palettes[0] || [];
-      
+
       for (const l of sourceColr.layers) {
-        const layerColorHex = l.paletteIndex === 0xFFFF ? 'currentColor' : (targetPalette[l.paletteIndex] || '#000000');
+        const layerColorHex = l.paletteIndex === 0xFFFF ? 'currentColor' : (targetPalette[l.paletteIndex] || '#ff0000');
         const newPaletteIdx = getOrAddPaletteColor(targetFontId, l.paletteIndex, layerColorHex);
-        
-        // Ensure layer glyph exists in newGlyphs
+
         let layerGid = l.glyphIndex;
         if (l.glyphIndex === sourceGid) {
-          // If layer glyph is the source glyph itself (like in single-layer color fonts such as Noto Znamenny),
-          // map directly to targetGid in the fused font
           layerGid = targetGid;
-        } else if (l.glyphIndex < targetFont.glyphs.length) {
-          const layerGlyph = targetFont.glyphs.get(l.glyphIndex);
-          if (layerGlyph) {
-            // Find existing identical glyph or append as unmapped layer glyph
-            const scale = (baseFont.unitsPerEm || 1000) / (targetFont.unitsPerEm || 1000);
-            const PathClass = opentype.Path;
-            const GlyphClass = opentype.Glyph;
-            const scaledPath = new PathClass();
-            if (layerGlyph.path && layerGlyph.path.commands) {
-              for (const cmd of layerGlyph.path.commands) {
-                if (cmd.type === 'M') scaledPath.moveTo(Math.round(cmd.x * scale), Math.round(cmd.y * scale));
-                else if (cmd.type === 'L') scaledPath.lineTo(Math.round(cmd.x * scale), Math.round(cmd.y * scale));
-                else if (cmd.type === 'Q') scaledPath.quadraticCurveTo(Math.round(cmd.x1 * scale), Math.round(cmd.y1 * scale), Math.round(cmd.x * scale), Math.round(cmd.y * scale));
-                else if (cmd.type === 'C') scaledPath.curveTo(Math.round(cmd.x1 * scale), Math.round(cmd.y1 * scale), Math.round(cmd.x2 * scale), Math.round(cmd.y2 * scale), Math.round(cmd.x * scale), Math.round(cmd.y * scale));
-                else if (cmd.type === 'Z') scaledPath.close();
-              }
-            }
-            
-            const newLayerGlyph = new GlyphClass({
-              name: `layer_${targetGid}_${l.glyphIndex}`,
-              advanceWidth: Math.round((layerGlyph.advanceWidth || 0) * scale),
-              path: scaledPath
-            });
-            layerGid = newGlyphs.length;
-            newGlyphs.push(newLayerGlyph);
-          }
+        } else {
+          layerGid = targetGid;
         }
-        
+
         remappedLayers.push({
           glyphID: layerGid,
           paletteIndex: newPaletteIdx
         });
       }
-      
+
       colrBaseGlyphMap.set(targetGid, {
         glyphID: targetGid,
         layers: remappedLayers
       });
     }
   }
-  
+
   // 4. Assemble final tables
   const hasMergedSvg = mergedSvgMap.size > 0;
   const hasMergedColr = colrBaseGlyphMap.size > 0;
   const hasMergedColor = hasMergedSvg || hasMergedColr;
-  
+
   let colrTable = null;
   let cpalTable = null;
-  let caplTable = null;
   let svgTable: Map<number, Uint8Array> | null = null;
-  
+
   if (hasMergedColor) {
-    // Build CPAL and CAPL tables
     cpalTable = buildCpalTable([masterPalette]);
-    caplTable = buildCaplTable([masterPalette]);
   }
-  
+
   if (hasMergedColr) {
     const colrBases = Array.from(colrBaseGlyphMap.values());
     colrTable = buildColrTable(colrBases);
   }
-  
+
   if (hasMergedSvg) {
     svgTable = mergedSvgMap;
   }
-  
+
   return {
     hasColor: hasMergedColor,
     colrTable,
     cpalTable,
-    caplTable,
+    caplTable: null,
     svgTable
   };
 }

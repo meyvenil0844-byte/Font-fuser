@@ -2,6 +2,7 @@ import React, { useRef, useState, useEffect } from 'react';
 import { Upload, X, Check, Star, ArrowUpDown, Palette, Sparkles, Layers, Code, AlertCircle, Eye, Loader2 } from 'lucide-react';
 import type { UploadedFont, GlyphMapping } from '../types';
 import { loadFontFiles, FONT_PALETTE_COLORS, type FontLoadingProgress } from '../lib/fontLoader';
+import type { RestoreProgress } from '../lib/workspace';
 import { ColorTablesModal } from './ColorTablesModal';
 import { cn } from '../lib/utils';
 
@@ -13,11 +14,27 @@ interface FontManagerProps {
   hasSelection: boolean;
   setGlyphMap?: React.Dispatch<React.SetStateAction<GlyphMapping>>;
   onJumpToBlockForFont?: (font: UploadedFont) => void;
+  isRestoringWorkspace?: boolean;
+  restoreProgress?: RestoreProgress | null;
+  externalLoadingProgress?: FontLoadingProgress | null;
+  isExternalProcessing?: boolean;
 }
 
 const COLORS = FONT_PALETTE_COLORS;
 
-export function FontManager({ fonts, setFonts, onApplyFont, onSetBaseFont, hasSelection, setGlyphMap, onJumpToBlockForFont }: FontManagerProps) {
+export function FontManager({ 
+  fonts, 
+  setFonts, 
+  onApplyFont, 
+  onSetBaseFont, 
+  hasSelection, 
+  setGlyphMap, 
+  onJumpToBlockForFont,
+  isRestoringWorkspace,
+  restoreProgress,
+  externalLoadingProgress,
+  isExternalProcessing
+}: FontManagerProps) {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const dragCounterRef = useRef(0);
   const [movingFontId, setMovingFontId] = useState<string | null>(null);
@@ -63,11 +80,11 @@ export function FontManager({ fonts, setFonts, onApplyFont, onSetBaseFont, hasSe
     setUploadError(null);
     setUploadSuccess(null);
     setUploadProgress({
-      current: 0,
+      current: 1,
       total: files.length,
-      percent: 0,
+      percent: 12,
       fileName: files[0]?.name || 'font file',
-      status: `Initializing ${files.length} file${files.length > 1 ? 's' : ''}...`
+      status: `Reading ${files[0]?.name || 'font file'}...`
     });
 
     try {
@@ -82,7 +99,7 @@ export function FontManager({ fonts, setFonts, onApplyFont, onSetBaseFont, hasSe
 
         setFonts(prev => {
           const remaining = prev.filter(p => !result.newFonts.some(nf => nf.id === p.id));
-          return [...result.newFonts, ...remaining];
+          return prev.length === 0 ? [...result.newFonts, ...remaining] : [...remaining, ...result.newFonts];
         });
 
         setUploadSuccess(`Loaded ${result.newFonts.length} font${result.newFonts.length > 1 ? 's' : ''} successfully!`);
@@ -90,7 +107,13 @@ export function FontManager({ fonts, setFonts, onApplyFont, onSetBaseFont, hasSe
 
         // Auto-jump to the block that has the most glyphs for the newly loaded font
         if (onJumpToBlockForFont && result.newFonts[0]) {
-          onJumpToBlockForFont(result.newFonts[0]);
+          setTimeout(() => {
+            try {
+              onJumpToBlockForFont(result.newFonts[0]);
+            } catch (e) {
+              console.warn('Block jump notice:', e);
+            }
+          }, 50);
         }
       }
 
@@ -104,8 +127,10 @@ export function FontManager({ fonts, setFonts, onApplyFont, onSetBaseFont, hasSe
     } catch (err: any) {
       setUploadError(`Failed to load font file: ${err?.message || String(err)}`);
     } finally {
-      setIsProcessingFonts(false);
-      setUploadProgress(null);
+      setTimeout(() => {
+        setIsProcessingFonts(false);
+        setUploadProgress(null);
+      }, 300);
     }
   };
 
@@ -148,18 +173,24 @@ export function FontManager({ fonts, setFonts, onApplyFont, onSetBaseFont, hasSe
     setMovingFontId(null);
   };
 
-
+  const visibleFonts = fonts.filter(f => !f.isHidden);
 
   return (
     <div 
+      data-font-manager-drop="true"
       onDragEnter={(e) => {
         e.preventDefault();
+        e.stopPropagation();
         dragCounterRef.current++;
         setIsDragging(true);
       }}
-      onDragOver={(e) => { e.preventDefault(); }}
+      onDragOver={(e) => { 
+        e.preventDefault(); 
+        e.stopPropagation();
+      }}
       onDragLeave={(e) => {
         e.preventDefault();
+        e.stopPropagation();
         dragCounterRef.current--;
         if (dragCounterRef.current <= 0) {
           dragCounterRef.current = 0;
@@ -168,6 +199,7 @@ export function FontManager({ fonts, setFonts, onApplyFont, onSetBaseFont, hasSe
       }}
       onDrop={(e) => {
         e.preventDefault();
+        e.stopPropagation();
         dragCounterRef.current = 0;
         setIsDragging(false);
         if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
@@ -190,40 +222,40 @@ export function FontManager({ fonts, setFonts, onApplyFont, onSetBaseFont, hasSe
       <div className="p-4 border-b border-white/5">
         <div className="flex items-center justify-between mb-3">
           <h2 className="text-[10px] uppercase text-gray-500 font-bold tracking-widest">
-            Loaded Font Files {fonts.length > 0 && `(${fonts.length})`}
+            Loaded Font Files {visibleFonts.length > 0 && `(${visibleFonts.length})`}
           </h2>
-          {fonts.length > 0 && (
-            <button
-              type="button"
-              onClick={openFilePicker}
-              className="text-[10px] font-bold text-blue-400 hover:text-blue-300 uppercase tracking-wider flex items-center gap-1 cursor-pointer hover:underline bg-transparent border-0 p-0 select-none"
-              title="Add more font files (Shortcut: F)"
-            >
-              <Upload className="w-3 h-3 shrink-0" /> + Add More
-            </button>
-          )}
-        </div>
-        
-        <div className="flex flex-col gap-2">
-          {fonts.length === 0 ? (
-            <button
-              type="button"
-              onClick={openFilePicker}
-              className="w-full py-6 text-center border-2 border-dashed border-white/10 hover:border-blue-500/50 rounded-lg p-4 cursor-pointer hover:bg-white/[0.02] transition-all block group bg-transparent select-none text-left"
-              title="Click to select font files or drag & drop here (Shortcut: F)"
-            >
-              <Upload className="w-6 h-6 text-gray-500 group-hover:text-blue-400 mx-auto mb-2 transition-colors shrink-0" />
-              <p className="text-xs text-center text-gray-200 font-bold group-hover:text-white transition-colors">Click to Select Fonts</p>
-              <p className="text-[10px] text-center text-gray-500 mt-1">or drag & drop files here (.ttf, .otf, .woff, .woff2, .ttc)</p>
-              <p className="text-[9px] text-center font-mono text-gray-600 mt-1">Press <kbd className="text-blue-400 font-bold">F</kbd> anytime</p>
-            </button>
-          ) : (
-            <>
-              {fonts.filter(f => !f.isHidden).map((font, idx) => {
-                const isBase = idx === 0;
-                const glyphCount = font.supportedCodePoints?.size || (font.parsed?.glyphs ? (font.parsed.glyphs.length || Object.keys(font.parsed.glyphs).length) : 0);
-                return (
-                  <React.Fragment key={font.id}>
+                {visibleFonts.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={openFilePicker}
+                    className="text-[10px] font-bold text-blue-400 hover:text-blue-300 uppercase tracking-wider flex items-center gap-1 cursor-pointer hover:underline bg-transparent border-0 p-0 select-none"
+                    title="Add more font files (Shortcut: F)"
+                  >
+                    <Upload className="w-3 h-3 shrink-0" /> + Add More
+                  </button>
+                )}
+              </div>
+              
+              <div className="flex flex-col gap-2">
+                {visibleFonts.length === 0 ? (
+                  <button
+                    type="button"
+                    onClick={openFilePicker}
+                    className="w-full py-6 text-center border-2 border-dashed border-white/10 hover:border-blue-500/50 rounded-lg p-4 cursor-pointer hover:bg-white/[0.02] transition-all block group bg-transparent select-none text-left"
+                    title="Click to select font files or drag & drop here (Shortcut: F)"
+                  >
+                    <Upload className="w-6 h-6 text-gray-500 group-hover:text-blue-400 mx-auto mb-2 transition-colors shrink-0" />
+                    <p className="text-xs text-center text-gray-200 font-bold group-hover:text-white transition-colors">Click to Select Fonts</p>
+                    <p className="text-[10px] text-center text-gray-500 mt-1">or drag & drop files here (.ttf, .otf, .woff, .woff2, .ttc)</p>
+                    <p className="text-[9px] text-center font-mono text-gray-600 mt-1">Press <kbd className="text-blue-400 font-bold">F</kbd> anytime</p>
+                  </button>
+                ) : (
+                  <>
+                    {visibleFonts.map((font, idx) => {
+                      const isBase = idx === 0;
+                      const glyphCount = font.parsed?.glyphs?.length ?? (font.supportedCodePoints?.size ? font.supportedCodePoints.size + 1 : 0);
+                      return (
+                        <React.Fragment key={font.id}>
                     <div 
                       onClick={() => {
                         if (movingFontId) {
@@ -397,30 +429,61 @@ export function FontManager({ fonts, setFonts, onApplyFont, onSetBaseFont, hasSe
         </div>
 
         <div className="mt-4 flex flex-col gap-2.5">
-          {/* Animated Processing Bar */}
-          {isProcessingFonts && uploadProgress && (
-            <div className="bg-[#141e30] border border-blue-500/40 rounded-lg p-3 shadow-lg flex flex-col gap-2 animate-in fade-in duration-200">
-              <div className="flex items-center justify-between text-xs font-mono text-blue-300">
+          {/* Animated Font Loading Progress Bar */}
+          {((isProcessingFonts && uploadProgress) || (isExternalProcessing && externalLoadingProgress)) && (() => {
+            const prog = uploadProgress || externalLoadingProgress!;
+            return (
+              <div className="bg-[#141e30] border border-blue-500/40 rounded-lg p-3 shadow-lg flex flex-col gap-2 animate-in fade-in duration-200">
+                <div className="flex items-center justify-between text-xs font-mono text-blue-300">
+                  <span className="flex items-center gap-1.5 font-bold">
+                    <Loader2 className="w-3.5 h-3.5 animate-spin text-blue-400 shrink-0" />
+                    Adding Font {prog.current}/{prog.total}
+                  </span>
+                  <span className="font-extrabold text-blue-400">{prog.percent}%</span>
+                </div>
+
+                {/* Progress Bar Track */}
+                <div className="w-full bg-[#0a101d] rounded-full h-2.5 overflow-hidden border border-blue-500/30 p-[1px]">
+                  <div 
+                    className="h-full bg-gradient-to-r from-blue-500 via-indigo-500 to-cyan-400 rounded-full transition-all duration-300 ease-out shadow-[0_0_12px_rgba(59,130,246,0.6)]"
+                    style={{ width: `${Math.max(8, prog.percent)}%` }}
+                  />
+                </div>
+
+                <div className="flex items-center justify-between text-[10px] text-gray-400 font-mono">
+                  <span className="truncate max-w-[170px]" title={prog.fileName}>
+                    {prog.fileName}
+                  </span>
+                  <span className="text-blue-400 animate-pulse font-medium">{prog.status || 'Processing...'}</span>
+                </div>
+              </div>
+            );
+          })()}
+
+          {/* Animated Saved Fonts Restoration Progress Bar */}
+          {isRestoringWorkspace && restoreProgress && (
+            <div className="bg-[#0f1d32] border border-cyan-500/40 rounded-lg p-3 shadow-lg flex flex-col gap-2 animate-in fade-in duration-200">
+              <div className="flex items-center justify-between text-xs font-mono text-cyan-300">
                 <span className="flex items-center gap-1.5 font-bold">
-                  <Loader2 className="w-3.5 h-3.5 animate-spin text-blue-400 shrink-0" />
-                  Adding Font {uploadProgress.current}/{uploadProgress.total}
+                  <Loader2 className="w-3.5 h-3.5 animate-spin text-cyan-400 shrink-0" />
+                  Restoring Saved Fonts ({restoreProgress.current}/{restoreProgress.total})
                 </span>
-                <span className="font-extrabold text-blue-400">{uploadProgress.percent}%</span>
+                <span className="font-extrabold text-cyan-400">{restoreProgress.percent}%</span>
               </div>
 
               {/* Progress Bar Track */}
-              <div className="w-full bg-[#0a101d] rounded-full h-2.5 overflow-hidden border border-blue-500/30 p-[1px]">
+              <div className="w-full bg-[#091424] rounded-full h-2.5 overflow-hidden border border-cyan-500/30 p-[1px]">
                 <div 
-                  className="h-full bg-gradient-to-r from-blue-500 via-indigo-500 to-cyan-400 rounded-full transition-all duration-300 ease-out shadow-[0_0_12px_rgba(59,130,246,0.6)]"
-                  style={{ width: `${Math.max(6, uploadProgress.percent)}%` }}
+                  className="h-full bg-gradient-to-r from-cyan-500 via-blue-500 to-indigo-400 rounded-full transition-all duration-300 ease-out shadow-[0_0_12px_rgba(6,182,212,0.6)]"
+                  style={{ width: `${Math.max(8, restoreProgress.percent)}%` }}
                 />
               </div>
 
               <div className="flex items-center justify-between text-[10px] text-gray-400 font-mono">
-                <span className="truncate max-w-[170px]" title={uploadProgress.fileName}>
-                  {uploadProgress.fileName}
+                <span className="truncate max-w-[170px]" title={restoreProgress.fileName}>
+                  {restoreProgress.fileName}
                 </span>
-                <span className="text-blue-400/80 animate-pulse font-medium">Processing...</span>
+                <span className="text-cyan-400 animate-pulse font-medium">{restoreProgress.status || 'Restoring...'}</span>
               </div>
             </div>
           )}

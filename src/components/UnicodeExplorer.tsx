@@ -21,29 +21,43 @@ interface UnicodeExplorerProps {
   setSelectedCharacters: React.Dispatch<React.SetStateAction<Set<number>>>;
 }
 
-// Binary search helper: fast O(log M) lookup to map codepoint to Unicode block
-function getBlockIndexForCodepoint(cp: number): number {
+// Pre-filtered and sorted valid Unicode blocks (excluding meta blocks with start < 0) for reliable O(log M) binary search
+export const VALID_UNICODE_BLOCKS = UNICODE_BLOCKS.map((b, i) => ({ ...b, originalIndex: i }))
+  .filter(b => typeof b.start === 'number' && b.start >= 0 && typeof b.end === 'number' && b.end >= b.start)
+  .sort((a, b) => a.start - b.start);
+
+// Binary search helper: fast O(log M) lookup to map codepoint to Unicode block original index
+export function getBlockIndexForCodepoint(cp: number): number {
+  if (typeof cp !== 'number' || cp < 0 || isNaN(cp)) return -1;
   let low = 0;
-  let high = UNICODE_BLOCKS.length - 1;
+  let high = VALID_UNICODE_BLOCKS.length - 1;
   while (low <= high) {
     const mid = (low + high) >> 1;
-    const b = UNICODE_BLOCKS[mid];
-    if (b.start < 0) {
-      low = mid + 1;
-      continue;
-    }
+    const b = VALID_UNICODE_BLOCKS[mid];
     if (cp < b.start) {
       high = mid - 1;
     } else if (cp > b.end) {
       low = mid + 1;
     } else {
-      return mid;
+      return b.originalIndex;
     }
   }
+  return -1;
+}
+
+export function isZnamennyCinnabarMark(cp: number): boolean {
+  // 46 Znamenny Cinnabar Combining Marks (U+1CF00 - U+1CF2D)
+  return cp >= 0x1CF00 && cp <= 0x1CF2D;
+}
+
+export function isZnamennyCombiningMark(cp: number): boolean {
+  // All Znamenny Musical Notation combining marks (0x1CF00 - 0x1CF2D Cinnabar, and 0x1CF30 - 0x1CF46 normal combining marks)
+  // Both are rendered in red
+  return (cp >= 0x1CF00 && cp <= 0x1CF2D) || (cp >= 0x1CF30 && cp <= 0x1CF46);
 }
 
 export function isCombiningMark(cp: number): boolean {
-  // Combining Diacritical Marks (0x0300 - 0x036F)
+  // Standard Combining Diacritical Marks (0x0300 - 0x036F)
   if (cp >= 0x0300 && cp <= 0x036F) return true;
   // Combining Diacritical Marks Extended (0x1AB0 - 0x1AFF)
   if (cp >= 0x1AB0 && cp <= 0x1AFF) return true;
@@ -53,8 +67,33 @@ export function isCombiningMark(cp: number): boolean {
   if (cp >= 0x20D0 && cp <= 0x20FF) return true;
   // Combining Half Marks (0xFE20 - 0xFE2F)
   if (cp >= 0xFE20 && cp <= 0xFE2F) return true;
-  // Znamenny Musical Notation combining cinnabar marks (0x1CF00 - 0x1CF46)
-  if (cp >= 0x1CF00 && cp <= 0x1CF46) return true;
+
+  // Cyrillic Supplement (0x0500 - 0x052F) are base letters (Komi, Mordvin, etc.), NOT combining marks!
+  if (cp >= 0x0500 && cp <= 0x052F) return false;
+
+  // Upper little character superscripts / subscripts are standalone modifiers, NOT combining marks!
+  // Superscripts and Subscripts (0x2070 - 0x209F)
+  if (cp >= 0x2070 && cp <= 0x209F) return false;
+  // Spacing Modifier Letters (0x02B0 - 0x02FF)
+  if (cp >= 0x02B0 && cp <= 0x02FF) return false;
+  // Phonetic Extensions (0x1D00 - 0x1DBF)
+  if (cp >= 0x1D00 && cp <= 0x1DBF) return false;
+  // Cyrillic Extended-A upper little letter superscripts (0x2DE0 - 0x2DFF) are NOT combining!
+  if (cp >= 0x2DE0 && cp <= 0x2DFF) return false;
+  // Cyrillic Extended-B letter superscripts (0xA674 - 0xA67D, 0xA69E, 0xA69F) are NOT combining!
+  if (cp >= 0xA674 && cp <= 0xA67D) return false;
+  if (cp === 0xA69E || cp === 0xA69F) return false;
+
+  // True Cyrillic combining diacritics ONLY:
+  if (cp >= 0x0483 && cp <= 0x0489) return true; // Titlo, palatalization, dasia, psili, pokrytie, enclosing signs
+  if (cp >= 0xA66F && cp <= 0xA673) return true; // Vzmet, enclosing signs, asterisk
+  if (cp === 0x1E08F) return true; // Combining Cyrillic small letter byelorussian-ukrainian i
+
+  // Znamenny Musical Notation combining marks (ONLY 0x1CF00 - 0x1CF2D and 0x1CF30 - 0x1CF46)
+  // Base musical notes/neumes (0x1CF50 - 0x1CFCF) are normal characters, NOT combining marks!
+  if (cp >= 0x1CF00 && cp <= 0x1CF2D) return true;
+  if (cp >= 0x1CF30 && cp <= 0x1CF46) return true;
+
   return false;
 }
 
@@ -137,17 +176,30 @@ export function UnicodeExplorer({ fonts, setFonts, glyphMap, setGlyphMap, select
             if (sfnt.codePoints.size > 0) s = sfnt.codePoints;
           } catch (e) {}
         }
-        if (s.size === 0 && f.parsed.glyphs) {
+        if (s.size === 0 && f.parsed.glyphs?.glyphs) {
           try {
-            const glyphs = f.parsed.glyphs;
-            const count = typeof glyphs.length === 'number' ? glyphs.length : Object.keys(glyphs).length;
-            for (let gIdx = 0; gIdx < count; gIdx++) {
-              const g = typeof glyphs.get === 'function' ? glyphs.get(gIdx) : glyphs[gIdx];
-              if (g) {
-                if (typeof g.unicode === 'number' && g.unicode > 0) s.add(g.unicode);
-                if (Array.isArray(g.unicodes)) {
-                  for (const u of g.unicodes) if (typeof u === 'number' && u > 0) s.add(u);
+            const glyphCollection = f.parsed.glyphs.glyphs;
+            if (Array.isArray(glyphCollection)) {
+              for (let i = 0; i < glyphCollection.length; i++) {
+                const g: any = glyphCollection[i];
+                if (g) {
+                  if (typeof g.unicode === 'number' && g.unicode > 0) s.add(g.unicode);
+                  if (Array.isArray(g.unicodes)) {
+                    for (const u of g.unicodes) if (typeof u === 'number' && u > 0) s.add(u);
+                  }
                 }
+                if (s.size >= 65536) break;
+              }
+            } else if (typeof glyphCollection === 'object') {
+              for (const k in glyphCollection) {
+                const g: any = glyphCollection[k];
+                if (g) {
+                  if (typeof g.unicode === 'number' && g.unicode > 0) s.add(g.unicode);
+                  if (Array.isArray(g.unicodes)) {
+                    for (const u of g.unicodes) if (typeof u === 'number' && u > 0) s.add(u);
+                  }
+                }
+                if (s.size >= 65536) break;
               }
             }
           } catch (e) {}
@@ -174,24 +226,44 @@ export function UnicodeExplorer({ fonts, setFonts, glyphMap, setGlyphMap, select
     }
 
     const blockCounts = new Uint32Array(UNICODE_BLOCKS.length);
+    let sampleCount = 0;
     for (const cp of supported) {
       if (typeof cp !== 'number' || cp < 0) continue;
       const bIdx = getBlockIndexForCodepoint(cp);
-      if (bIdx !== -1) {
+      if (typeof bIdx === 'number' && bIdx >= 0 && bIdx < blockCounts.length) {
         blockCounts[bIdx]++;
       }
+      sampleCount++;
+      if (sampleCount >= 10000) break; // Sampling 10k glyphs is more than sufficient and executes in < 2ms
     }
 
     let bestIdx = -1;
     let maxCount = 0;
+    let fallbackPuaIdx = -1;
+    let maxPuaCount = 0;
+
     for (let i = 0; i < blockCounts.length; i++) {
-      if (blockCounts[i] > maxCount) {
-        maxCount = blockCounts[i];
-        bestIdx = i;
+      const bName = UNICODE_BLOCKS[i]?.name || '';
+      const isPUA = bName.includes('Private Use') || bName.includes('PUA');
+      if (isPUA) {
+        if (blockCounts[i] > maxPuaCount) {
+          maxPuaCount = blockCounts[i];
+          fallbackPuaIdx = i;
+        }
+      } else {
+        if (blockCounts[i] > maxCount) {
+          maxCount = blockCounts[i];
+          bestIdx = i;
+        }
       }
     }
 
-    if (bestIdx !== -1 && maxCount > 0) {
+    if (bestIdx === -1 && fallbackPuaIdx !== -1) {
+      bestIdx = fallbackPuaIdx;
+      maxCount = maxPuaCount;
+    }
+
+    if (bestIdx !== -1 && maxCount > 0 && UNICODE_BLOCKS[bestIdx]) {
       const res = { index: bestIdx, name: UNICODE_BLOCKS[bestIdx].name, count: maxCount };
       if (cacheKey) bestBlockByFontIdCache.set(cacheKey, res);
       return res;
@@ -278,8 +350,56 @@ export function UnicodeExplorer({ fonts, setFonts, glyphMap, setGlyphMap, select
 
     const start = block.start;
     const end = block.end;
+    const isLargeBlock = (end - start) > 2500;
+
+    if (isLargeBlock && !query) {
+      // For ultra-large blocks (CJK, PUA), instantly collect supported glyphs via font sets (< 1ms)
+      const supportedList: number[] = [];
+      const supportedSet = new Set<number>();
+
+      const activeFontIds = new Set<string>();
+      if (baseFont?.id) activeFontIds.add(baseFont.id);
+      for (const fid of Object.values(glyphMap)) {
+        if (fid) activeFontIds.add(fid);
+      }
+
+      for (const fid of activeFontIds) {
+        const supp = fontSupportedMap.get(fid);
+        if (supp && supp.size > 0) {
+          for (const cp of supp) {
+            if (cp >= start && cp <= end && !supportedSet.has(cp)) {
+              if (safeStringFromCodePoint(cp)) {
+                supportedSet.add(cp);
+                supportedList.push(cp);
+                if (supportedList.length >= 2500) break;
+              }
+            }
+          }
+        }
+        if (supportedList.length >= 2500) break;
+      }
+
+      if (!showEmpty) {
+        supportedList.sort((a, b) => a - b);
+        return supportedList;
+      }
+
+      // If showEmpty is true, include all supported glyphs + fill up to 2,500 with unmapped glyphs
+      for (let i = 0; i < supportedList.length; i++) {
+        chars.push(supportedList[i]);
+      }
+      for (let cp = start; cp <= end; cp++) {
+        if (chars.length >= 2500) break;
+        if (!supportedSet.has(cp) && safeStringFromCodePoint(cp)) {
+          chars.push(cp);
+        }
+      }
+      chars.sort((a, b) => a - b);
+      return chars;
+    }
 
     for (let cp = start; cp <= end; cp++) {
+      if (chars.length >= 2500) break;
       const charStr = safeStringFromCodePoint(cp);
       let isMissing = false;
       
@@ -984,175 +1104,191 @@ export function UnicodeExplorer({ fonts, setFonts, glyphMap, setGlyphMap, select
         ) : (
           <VirtuosoGrid
             ref={virtuosoRef}
-            scrollerRef={(el) => {
-              if (el) {
-                (el as HTMLElement).onscroll = () => {
-                  if ((el as HTMLElement).scrollTop <= 5) {
-                    setIsHeaderVisible(true);
-                  }
-                };
-              }
-            }}
             style={{ height: '100%', width: '100%' }}
-            overscan={400}
-            increaseViewportBy={{ top: 600, bottom: 800 }}
+            overscan={32}
             data={characters}
             listClassName="grid zoomable-grid gap-3 p-6 touch-pan-y touch-manipulation min-h-full"
             itemContent={(index, cp) => {
-              const mappedFontId = glyphMap[cp];
-              const displayFont = mappedFontId 
-                ? fontMap.get(mappedFontId) 
-                : baseFont;
-              
-              const isMapped = !!mappedFontId;
-              const isSelected = selectedCharacters.has(cp);
-              const colorMap = displayFont?.colorData?.codepointColorMap;
-              const colorRecord = colorMap instanceof Map 
-                ? colorMap.get(cp) 
-                : (colorMap && typeof colorMap === 'object' ? (colorMap as any)[cp] : undefined);
-              const hasColorGlyph = !!colorRecord;
-              const isArabic = isArabicCodepoint(cp);
-              const ligatureInfo = ARABIC_LIGATURE_INFO[cp];
-              const joiningType = isArabic ? getArabicJoiningType(cp) : null;
-              const isDuployan = isDuployanCodepoint(cp);
-              const isDupControl = isDuployanControl(cp);
-              const dupControlInfo = isDupControl ? getDuployanControlInfo(cp) : null;
-              const isDupAffix = isDuployanAffixOrMark(cp);
-              const isDupUnassigned = isDuployan && isDuployanUnassigned(cp);
-              const isCombining = isCombiningMark(cp);
+              try {
+                const mappedFontId = glyphMap[cp];
+                const displayFont = mappedFontId 
+                  ? fontMap.get(mappedFontId) 
+                  : baseFont;
+                
+                const isMapped = !!mappedFontId;
+                const isSelected = selectedCharacters.has(cp);
+                const colorMap = displayFont?.colorData?.codepointColorMap;
+                const colorRecord = colorMap instanceof Map 
+                  ? colorMap.get(cp) 
+                  : (colorMap && typeof colorMap === 'object' ? (colorMap as any)[cp] : undefined);
+                const hasColorGlyph = !!colorRecord;
+                const isArabic = isArabicCodepoint(cp);
+                const ligatureInfo = ARABIC_LIGATURE_INFO[cp];
+                const joiningType = isArabic ? getArabicJoiningType(cp) : null;
+                const isDuployan = isDuployanCodepoint(cp);
+                const isDupControl = isDuployanControl(cp);
+                const dupControlInfo = isDupControl ? getDuployanControlInfo(cp) : null;
+                const isDupAffix = isDuployanAffixOrMark(cp);
+                const isDupUnassigned = isDuployan && isDuployanUnassigned(cp);
+                const isCombining = isCombiningMark(cp);
 
-              let tooltipTitle = `U+${cp.toString(16).toUpperCase().padStart(4, '0')}`;
-              if (isMapped && displayFont) tooltipTitle += ` (${displayFont.name})`;
-              if (hasColorGlyph) {
-                const colorLabel = colorRecord?.layers?.[0]?.color ? ` [Color: ${colorRecord.layers[0].color}]` : ' [Color Font]';
-                tooltipTitle += colorRecord?.hasSVG ? ' [SVG in OpenType]' : colorLabel;
-              }
-              if (isCombining) tooltipTitle += ` [Combining Mark]`;
-              if (isDuployan && DUPLOYAN_NAMES[cp]) tooltipTitle += ` [${DUPLOYAN_NAMES[cp]}]`;
-              else if (ligatureInfo) tooltipTitle += ` [${ligatureInfo.name}]`;
-              else if (joiningType) {
-                const typeNames: Record<string, string> = {
-                  'D': 'Dual Joining',
-                  'R': 'Right Joining',
-                  'L': 'Left Joining',
-                  'U': 'Non-Joining',
-                  'C': 'Join-Causing (Tatweel/ZWJ)',
-                  'T': 'Transparent (Harakat)'
-                };
-                tooltipTitle += ` [${typeNames[joiningType] || joiningType}]`;
-              }
+                const isCinnabar = isZnamennyCinnabarMark(cp);
+                const isZnamennyComb = isZnamennyCombiningMark(cp);
+                const isRedZnamenny = isZnamennyComb; // Both cinnabar and normal Znamenny combining marks are red
 
-              return (
-                <div 
-                  key={cp}
-                  onPointerDown={(e) => handlePointerDown(e, cp)}
-                  onPointerEnter={(e) => handlePointerEnter(e, cp)}
-                  onPointerUp={(e) => handlePointerUpItem(e, cp)}
-                  className={cn(
-                    "group relative flex flex-col items-center justify-center aspect-square rounded-sm border cursor-pointer select-none transition-all touch-manipulation active:scale-95",
-                    isSelected 
-                      ? "bg-blue-500/20 border-blue-400 shadow-[inset_0_0_15px_rgba(59,130,246,0.2)]" 
-                      : isMapped
-                        ? "bg-white/5 border-white/20"
-                        : "bg-[#1a1a1a] border-white/5 hover:border-white/30"
-                  )}
-                  style={{
-                    borderColor: isSelected ? undefined : (isMapped && displayFont ? displayFont.color : undefined),
-                  }}
-                  title={tooltipTitle}
-                >
-                  {isMapped && displayFont && (
-                    <div 
-                      className="absolute top-1 right-1 w-1.5 h-1.5 rounded-full" 
-                      style={{ 
-                        backgroundColor: displayFont.color,
-                        boxShadow: `0 0 6px ${displayFont.color}`
-                      }} 
-                    />
-                  )}
+                let tooltipTitle = `U+${cp.toString(16).toUpperCase().padStart(4, '0')}`;
+                if (isMapped && displayFont) tooltipTitle += ` (${displayFont.name})`;
+                if (hasColorGlyph) {
+                  const colorLabel = colorRecord?.layers?.[0]?.color ? ` [Color: ${colorRecord.layers[0].color}]` : ' [Color Font]';
+                  tooltipTitle += colorRecord?.hasSVG ? ' [SVG in OpenType]' : colorLabel;
+                }
+                if (isCinnabar) tooltipTitle += ` [Znamenny Cinnabar Mark]`;
+                else if (isZnamennyComb) tooltipTitle += ` [Znamenny Combining Mark]`;
+                else if (isCombining) tooltipTitle += ` [Combining Mark]`;
+                if (isDuployan && DUPLOYAN_NAMES[cp]) tooltipTitle += ` [${DUPLOYAN_NAMES[cp]}]`;
+                else if (ligatureInfo) tooltipTitle += ` [${ligatureInfo.name}]`;
+                else if (joiningType) {
+                  const typeNames: Record<string, string> = {
+                    'D': 'Dual Joining',
+                    'R': 'Right Joining',
+                    'L': 'Left Joining',
+                    'U': 'Non-Joining',
+                    'C': 'Join-Causing (Tatweel/ZWJ)',
+                    'T': 'Transparent (Harakat)'
+                  };
+                  tooltipTitle += ` [${typeNames[joiningType] || joiningType}]`;
+                }
 
-                  {hasColorGlyph && (
-                    <span 
-                      className="absolute top-1 left-1 text-[7.5px] font-mono font-bold leading-none px-1 py-0.5 rounded bg-purple-500/30 text-purple-300 border border-purple-500/40 pointer-events-none"
-                      title={colorRecord?.hasSVG ? "SVG in OpenType" : "COLR / CPAL Layer"}
-                    >
-                      {colorRecord?.hasSVG ? 'SVG' : 'COLR'}
-                    </span>
-                  )}
+                return (
+                  <div 
+                    key={cp}
+                    onPointerDown={(e) => handlePointerDown(e, cp)}
+                    onPointerEnter={(e) => handlePointerEnter(e, cp)}
+                    onPointerUp={(e) => handlePointerUpItem(e, cp)}
+                    className={cn(
+                      "group relative flex flex-col items-center justify-center aspect-square rounded-sm border cursor-pointer select-none transition-all touch-manipulation active:scale-95",
+                      isSelected 
+                        ? "bg-blue-500/20 border-blue-400 shadow-[inset_0_0_15px_rgba(59,130,246,0.2)]" 
+                        : isMapped
+                          ? "bg-white/5 border-white/20"
+                          : "bg-[#1a1a1a] border-white/5 hover:border-white/30"
+                    )}
+                    style={{
+                      borderColor: isSelected ? undefined : (isMapped && displayFont ? displayFont.color : undefined),
+                    }}
+                    title={tooltipTitle}
+                  >
+                    {isMapped && displayFont && (
+                      <div 
+                        className="absolute top-1 right-1 w-1.5 h-1.5 rounded-full" 
+                        style={{ 
+                          backgroundColor: displayFont.color,
+                          boxShadow: `0 0 6px ${displayFont.color}`
+                        }} 
+                      />
+                    )}
 
-                  {isArabic && (
-                    <span 
-                      className="absolute top-1 left-1 text-[8px] font-mono leading-none opacity-40 group-hover:opacity-100 text-amber-400/80 pointer-events-none"
-                      title={joiningType === 'C' ? 'Tatweel / Join Causing' : ligatureInfo ? ligatureInfo.type : joiningType === 'D' ? 'Dual' : joiningType === 'R' ? 'Right' : ''}
-                    >
-                      {cp === 0x0640 ? 'ـ' : ligatureInfo?.type === 'Ligature' ? 'L' : joiningType === 'D' ? 'ـ' : joiningType === 'R' ? 'ر' : ''}
-                    </span>
-                  )}
+                    {hasColorGlyph && (
+                      <span 
+                        className="absolute top-1 left-1 text-[7.5px] font-mono font-bold leading-none px-1 py-0.5 rounded bg-purple-500/30 text-purple-300 border border-purple-500/40 pointer-events-none"
+                        title={colorRecord?.hasSVG ? "SVG in OpenType" : "COLR / CPAL Layer"}
+                      >
+                        {colorRecord?.hasSVG ? 'SVG' : 'COLR'}
+                      </span>
+                    )}
 
-                  {isDupControl && (
-                    <span 
-                      className="absolute top-1 left-1 text-[8px] font-mono leading-none opacity-70 group-hover:opacity-100 text-purple-400 pointer-events-none"
-                      title={dupControlInfo?.name}
-                    >
-                      CTL
-                    </span>
-                  )}
+                    {isArabic && (
+                      <span 
+                        className="absolute top-1 left-1 text-[8px] font-mono leading-none opacity-40 group-hover:opacity-100 text-amber-400/80 pointer-events-none"
+                        title={joiningType === 'C' ? 'Tatweel / Join Causing' : ligatureInfo ? ligatureInfo.type : joiningType === 'D' ? 'Dual' : joiningType === 'R' ? 'Right' : ''}
+                      >
+                        {cp === 0x0640 ? 'ـ' : ligatureInfo?.type === 'Ligature' ? 'L' : joiningType === 'D' ? 'ـ' : joiningType === 'R' ? 'ر' : ''}
+                      </span>
+                    )}
 
-                  {isDupAffix && (
-                    <span 
-                      className="absolute top-1 left-1 text-[8px] font-mono leading-none opacity-50 group-hover:opacity-100 text-cyan-400/80 pointer-events-none"
-                      title="Duployan Affix / Combining Mark"
-                    >
-                      AFX
-                    </span>
-                  )}
-                  
-                  {colorRecord?.svgDocument ? (
-                    <div 
-                      className="flex-1 w-full h-full flex items-center justify-center p-1.5 pointer-events-none [&>svg]:max-h-full [&>svg]:max-w-full [&>svg]:w-auto [&>svg]:h-auto overflow-hidden"
-                      dangerouslySetInnerHTML={{ __html: colorRecord.svgDocument }}
-                    />
-                  ) : (
-                    <span 
-                      className="flex-1 w-full flex items-center justify-center text-2xl leading-none overflow-hidden select-none min-h-0" 
-                      style={{ 
-                        fontFamily: `${displayFont?.fontFamilyName ? `"${displayFont.fontFamilyName}", ` : ''}'Noto Sans Duployan', sans-serif`,
-                        color: hasColorGlyph && colorRecord?.layers?.[0]?.color && colorRecord.layers[0].color !== 'currentColor'
-                          ? colorRecord.layers[0].color 
-                          : (isMapped ? '#e5e5e5' : '#888')
-                      }}
-                    >
-                      {isDupControl ? (
-                        <div className="flex flex-col items-center justify-center pointer-events-none">
-                          <span className="text-xl font-mono text-purple-400 font-bold leading-tight">
-                            {dupControlInfo?.symbol}
+                    {isDupControl && (
+                      <span 
+                        className="absolute top-1 left-1 text-[8px] font-mono leading-none opacity-70 group-hover:opacity-100 text-purple-400 pointer-events-none"
+                        title={dupControlInfo?.name}
+                      >
+                        CTL
+                      </span>
+                    )}
+
+                    {isDupAffix && (
+                      <span 
+                        className="absolute top-1 left-1 text-[8px] font-mono leading-none opacity-50 group-hover:opacity-100 text-cyan-400/80 pointer-events-none"
+                        title="Duployan Affix / Combining Mark"
+                      >
+                        AFX
+                      </span>
+                    )}
+                    
+                    {colorRecord?.svgDocument && !isCombining && !isDupAffix ? (
+                      <div className="flex-1 w-full h-full flex items-center justify-center p-1 pointer-events-none overflow-hidden">
+                        <div 
+                          className="w-6 h-6 flex items-center justify-center [&>svg]:w-full [&>svg]:h-full [&>svg]:object-contain"
+                          dangerouslySetInnerHTML={{ __html: colorRecord.svgDocument }}
+                        />
+                      </div>
+                    ) : (
+                      <span 
+                        className="flex-1 w-full flex items-center justify-center text-2xl leading-none overflow-hidden select-none min-h-0" 
+                        style={{ 
+                          fontFamily: `${displayFont?.fontFamilyName ? `"${displayFont.fontFamilyName}", ` : ''}'Noto Sans Duployan', 'Noto Znamenny Musical Notation', sans-serif`,
+                          color: hasColorGlyph && colorRecord?.layers?.[0]?.color && colorRecord.layers[0].color !== 'currentColor'
+                            ? colorRecord.layers[0].color 
+                            : (isRedZnamenny ? '#ef4444' : (isMapped ? '#e5e5e5' : '#888'))
+                        }}
+                      >
+                        {isDupControl ? (
+                          <div className="flex flex-col items-center justify-center pointer-events-none">
+                            <span className="text-xl font-mono text-purple-400 font-bold leading-tight">
+                              {dupControlInfo?.symbol}
+                            </span>
+                            <span className="text-[7.5px] font-mono text-purple-300/80 uppercase tracking-tighter leading-none mt-0.5">
+                              {dupControlInfo?.label}
+                            </span>
+                          </div>
+                        ) : (isCombining || isDupAffix) ? (
+                          <span className="relative inline-flex items-center justify-center pointer-events-none min-w-[1.3em] overflow-visible">
+                            <span className="opacity-30 text-gray-400 font-sans text-xl absolute select-none pointer-events-none">◌</span>
+                            <span 
+                              className="relative z-10" 
+                              style={{ 
+                                color: (hasColorGlyph && colorRecord?.layers?.[0]?.color && colorRecord.layers[0].color !== 'currentColor')
+                                  ? colorRecord.layers[0].color
+                                  : (isRedZnamenny ? '#ef4444' : (isMapped ? '#e5e5e5' : '#888'))
+                              }}
+                            >
+                              {safeStringFromCodePoint(cp)}
+                            </span>
                           </span>
-                          <span className="text-[7.5px] font-mono text-purple-300/80 uppercase tracking-tighter leading-none mt-0.5">
-                            {dupControlInfo?.label}
-                          </span>
-                        </div>
-                      ) : (isCombining || isDupAffix) ? (
-                        <span className="relative inline-flex items-center justify-center pointer-events-none min-w-[1.2em]">
-                          <span className="opacity-25 text-gray-500 font-sans text-xl absolute select-none pointer-events-none">◌</span>
-                          <span className="relative z-10">{safeStringFromCodePoint(cp)}</span>
-                        </span>
-                      ) : isDupUnassigned ? (
-                        <span className="text-[10px] font-mono border border-dashed border-gray-600 px-1 text-gray-500">.notdef</span>
-                      ) : (block?.name === 'Forgotten Characters' && cp !== 0xFFFD && cp !== 0x0020) ? (
-                         <div className="text-[10px] font-mono border border-dashed border-gray-600 px-1 text-gray-500 opacity-50 min-w-[12px] min-h-[12px] flex items-center justify-center">
-                           {safeStringFromCodePoint(cp)}
-                         </div>
-                      ) : safeStringFromCodePoint(cp) || <span className="text-[10px] font-mono border border-dashed border-gray-600 px-1 text-gray-500">.notdef</span>}
+                        ) : isDupUnassigned ? (
+                          <span className="text-[10px] font-mono border border-dashed border-gray-600 px-1 text-gray-500">.notdef</span>
+                        ) : (block?.name === 'Forgotten Characters' && cp !== 0xFFFD && cp !== 0x0020) ? (
+                           <div className="text-[10px] font-mono border border-dashed border-gray-600 px-1 text-gray-500 opacity-50 min-w-[12px] min-h-[12px] flex items-center justify-center">
+                             {safeStringFromCodePoint(cp)}
+                           </div>
+                        ) : safeStringFromCodePoint(cp) || <span className="text-[10px] font-mono border border-dashed border-gray-600 px-1 text-gray-500">.notdef</span>}
+                      </span>
+                    )}
+                    <span className={cn(
+                      "text-[9px] font-mono leading-none pb-0.5 shrink-0",
+                      isMapped ? "text-blue-400/70" : "text-gray-600"
+                    )}>
+                      {cp.toString(16).toUpperCase().padStart(4, '0')}
                     </span>
-                  )}
-                  <span className={cn(
-                    "text-[9px] font-mono leading-none pb-0.5 shrink-0",
-                    isMapped ? "text-blue-400/70" : "text-gray-600"
-                  )}>
-                    {cp.toString(16).toUpperCase().padStart(4, '0')}
-                  </span>
-                </div>
-              );
+                  </div>
+                );
+              } catch (renderCellErr) {
+                return (
+                  <div key={cp} className="flex flex-col items-center justify-center aspect-square rounded-sm border border-white/5 bg-[#1a1a1a] text-gray-500 text-[10px] select-none p-1">
+                    <span>.notdef</span>
+                    <span className="text-[9px] font-mono text-gray-600">{typeof cp === 'number' ? cp.toString(16).toUpperCase().padStart(4, '0') : ''}</span>
+                  </div>
+                );
+              }
             }}
           />
         )}

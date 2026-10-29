@@ -1,8 +1,8 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { X, Save, Trash2, FolderOpen, Download, Upload, Plus, FileType, FileDown, Loader2 } from 'lucide-react';
+import { X, Save, Trash2, FolderOpen, Download, Upload, Plus, FileType, FileDown, Loader2, Zap } from 'lucide-react';
 import { generateFusedFont, downloadArrayBuffer } from '../lib/fontUtils';
 import { getFusionsList, saveNamedFusion, loadNamedFusion, deleteNamedFusion, registerFontBuffer, type FusionSaveInfo } from '../lib/workspace';
-import { exportFusionWorkspace, importFusionWorkspace } from '../lib/exportUtils';
+import { exportFusionWorkspace, importFusionWorkspace, exportSavedProjectAsFuser } from '../lib/exportUtils';
 import type { UploadedFont, GlyphMapping } from '../types';
 import { cn } from '../lib/utils';
 import { ErrorBoundary } from './ErrorBoundary';
@@ -17,6 +17,7 @@ interface SavesModalProps {
   onNewProject: (name: string) => void;
   onSaveCurrent: (name: string) => void;
   onRenameCurrent: (name: string) => void;
+  onOpenSaveToTtfConverter?: (projectId?: string, projectName?: string) => void;
 }
 
 
@@ -47,7 +48,7 @@ function formatProjectDate(timestamp: any): string {
   }
 }
 
-export function SavesModal({ isOpen, onClose, currentFonts, currentGlyphMap, currentProjectName, onLoad, onNewProject, onSaveCurrent, onRenameCurrent }: SavesModalProps) {
+export function SavesModal({ isOpen, onClose, currentFonts, currentGlyphMap, currentProjectName, onLoad, onNewProject, onSaveCurrent, onRenameCurrent, onOpenSaveToTtfConverter }: SavesModalProps) {
   const [fusions, setFusions] = useState<FusionSaveInfo[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [notification, setNotification] = useState<{ text: string; type: 'error' | 'info' } | null>(null);
@@ -103,15 +104,31 @@ export function SavesModal({ isOpen, onClose, currentFonts, currentGlyphMap, cur
     e.stopPropagation();
     setIsLoading(true);
     setNotification(null);
+    const progressEl = document.getElementById('modal-progress-' + fusion.id);
+    if (progressEl) progressEl.innerText = "Exporting .fuser...";
     try {
-      const data = await loadNamedFusion(fusion.id);
-      if (data) {
-        await exportFusionWorkspace(fusion.name, data.fonts, data.glyphMap);
-      }
+      await exportSavedProjectAsFuser(fusion.id, fusion.name, fusion.storageKey);
+      if (progressEl) progressEl.innerText = "Downloaded .fuser!";
+      setNotification({ text: `Downloaded "${fusion.name}.fuser" successfully!`, type: 'info' });
     } catch (err: any) {
-      setNotification({ text: "Failed to export: " + err.message, type: 'error' });
+      console.error('Failed to export:', err);
+      try {
+        const data = await loadNamedFusion(fusion.id, fusion.name, fusion.storageKey);
+        if (data && data.fonts && data.fonts.length > 0) {
+          await exportFusionWorkspace(fusion.name, data.fonts, data.glyphMap);
+          if (progressEl) progressEl.innerText = "Downloaded .fuser!";
+          setNotification({ text: `Downloaded "${fusion.name}.fuser" successfully!`, type: 'info' });
+          return;
+        }
+      } catch (e2) {}
+      setNotification({ text: "Failed to export .fuser: " + (err.message || String(err)), type: 'error' });
+      if (progressEl) progressEl.innerText = "Export error";
     } finally {
       setIsLoading(false);
+      setTimeout(() => {
+        const p = document.getElementById('modal-progress-' + fusion.id);
+        if (p && p.innerText.includes('.fuser')) p.innerText = "";
+      }, 3000);
     }
   };
 
@@ -125,8 +142,8 @@ export function SavesModal({ isOpen, onClose, currentFonts, currentGlyphMap, cur
       const data = await loadNamedFusion(fusion.id);
       if (data && data.fonts && data.fonts.length > 0) {
         const baseFont = data.fonts[0];
-        const arrayBuffer = await generateFusedFont(baseFont, data.fonts, data.glyphMap, (msg) => {
-           if (progressEl) progressEl.innerText = msg;
+        const arrayBuffer = await generateFusedFont(baseFont, data.fonts, data.glyphMap, (msg, pct) => {
+           if (progressEl) progressEl.innerText = (typeof pct === 'number' ? `(${pct}%) ` : '') + msg;
         });
         const baseName = (fusion.name || 'FusedFont').replace(/\.(otf|ttf|woff|woff2)$/i, '').trim() || 'FusedFont';
         const downloadName = `${baseName}.otf`;
@@ -183,12 +200,15 @@ export function SavesModal({ isOpen, onClose, currentFonts, currentGlyphMap, cur
           if (f.buffer) registerFontBuffer(f.id, f.name, f.fileName, f.buffer);
         });
       }
-      const data = await loadNamedFusion(fusion.id);
-      if (data) {
+      const data = await loadNamedFusion(fusion.id, fusion.name, fusion.storageKey);
+      if (data && Array.isArray(data.fonts) && data.fonts.length > 0) {
         onLoad(data.fonts, data.glyphMap, fusion.name);
         onClose();
       } else {
-        setNotification({ text: "Project loaded with empty fonts.", type: 'info' });
+        setNotification({ 
+          text: `Could not load fonts for "${fusion.name || 'this project'}". Your current workspace was safely preserved.`, 
+          type: 'error' 
+        });
       }
     } catch (err: any) {
       console.error('Failed to load project:', err);
@@ -225,6 +245,16 @@ export function SavesModal({ isOpen, onClose, currentFonts, currentGlyphMap, cur
               onChange={handleImportFile} 
               className="hidden" 
             />
+            <button 
+              onClick={() => {
+                onClose();
+                onOpenSaveToTtfConverter?.();
+              }}
+              className="flex items-center gap-1.5 px-3 py-1.5 bg-emerald-600/20 text-emerald-400 hover:bg-emerald-600/30 text-[10px] font-bold uppercase tracking-wider rounded transition-colors"
+              title="Fast Save File to TTF Converter"
+            >
+              <Zap className="w-3.5 h-3.5 fill-current" /> Save → TTF Converter
+            </button>
             <button 
               onClick={() => fileInputRef.current?.click()}
               disabled={isLoading}
@@ -267,7 +297,7 @@ export function SavesModal({ isOpen, onClose, currentFonts, currentGlyphMap, cur
               return (
                 <div 
                   key={fusion.id} 
-                  onClick={() => !isLoading && handleLoad(fusion)}
+                  onClick={() => handleLoad(fusion)}
                   className={cn(
                     "aspect-video bg-[#1a1a1a] border rounded-lg p-4 flex flex-col justify-between cursor-pointer transition-all group relative overflow-hidden",
                     isOpening 
@@ -287,9 +317,16 @@ export function SavesModal({ isOpen, onClose, currentFonts, currentGlyphMap, cur
                         <Loader2 className="w-3.5 h-3.5 animate-spin text-amber-400" /> Opening...
                       </span>
                     ) : (
-                      <span className="text-[10px] font-mono text-blue-400 uppercase font-semibold group-hover:text-blue-300 group-hover:underline">
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          handleLoad(fusion);
+                        }}
+                        className="text-[10px] font-mono text-blue-400 uppercase font-semibold group-hover:text-blue-300 group-hover:underline bg-transparent border-0 p-0 text-left cursor-pointer"
+                      >
                         Click to Edit
-                      </span>
+                      </button>
                     )}
                     <div className="flex items-center gap-1 opacity-100" onClick={(e) => e.stopPropagation()}>
                       <button 
@@ -299,6 +336,18 @@ export function SavesModal({ isOpen, onClose, currentFonts, currentGlyphMap, cur
                         title="Export Project Save File (.fuser)"
                       >
                         <FileDown className="w-4 h-4" />
+                      </button>
+                      <button 
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          onClose();
+                          onOpenSaveToTtfConverter?.(fusion.id, fusion.name);
+                        }}
+                        disabled={isLoading}
+                        className="p-1.5 text-emerald-400 hover:text-emerald-300 hover:bg-emerald-950/50 rounded transition-colors"
+                        title="Fast Convert Save to TTF Font (.ttf)"
+                      >
+                        <Zap className="w-4 h-4 fill-current" />
                       </button>
                       <button 
                         onClick={(e) => handleDownloadTTF(fusion, e)}
@@ -358,13 +407,38 @@ export function SavesModal({ isOpen, onClose, currentFonts, currentGlyphMap, cur
                 isLoading={isLoading} 
               />
             </div>
-            <button 
-              onClick={() => handleSaveCurrent()}
-              disabled={isLoading || currentFonts.length === 0}
-              className="bg-blue-600 hover:bg-blue-500 text-white px-6 py-3 rounded text-xs font-bold uppercase tracking-wider disabled:opacity-50 transition-colors flex items-center gap-2 w-full sm:w-auto justify-center shadow-lg"
-            >
-              <Save className="w-4 h-4" /> Save Snapshot
-            </button>
+            <div className="flex items-center gap-2 w-full sm:w-auto">
+              <button 
+                onClick={async () => {
+                  if (currentFonts.length === 0) {
+                    setNotification({ text: "Add fonts to your workspace before exporting.", type: 'info' });
+                    return;
+                  }
+                  setIsLoading(true);
+                  setNotification(null);
+                  try {
+                    await exportFusionWorkspace(currentProjectName, currentFonts, currentGlyphMap);
+                    setNotification({ text: `Downloaded "${currentProjectName}.fuser" with all font data!`, type: 'info' });
+                  } catch (err: any) {
+                    setNotification({ text: "Failed to export: " + (err.message || String(err)), type: 'error' });
+                  } finally {
+                    setIsLoading(false);
+                  }
+                }}
+                disabled={isLoading || currentFonts.length === 0}
+                className="bg-emerald-600/20 hover:bg-emerald-600/30 text-emerald-300 border border-emerald-500/30 px-4 py-3 rounded text-xs font-bold uppercase tracking-wider disabled:opacity-50 transition-colors flex items-center gap-2 justify-center shadow-md flex-1 sm:flex-initial"
+                title="Export current workspace as a self-contained .fuser save file"
+              >
+                <FileDown className="w-4 h-4 text-emerald-400" /> Export .fuser
+              </button>
+              <button 
+                onClick={() => handleSaveCurrent()}
+                disabled={isLoading || currentFonts.length === 0}
+                className="bg-blue-600 hover:bg-blue-500 text-white px-6 py-3 rounded text-xs font-bold uppercase tracking-wider disabled:opacity-50 transition-colors flex items-center gap-2 justify-center shadow-lg flex-1 sm:flex-initial"
+              >
+                <Save className="w-4 h-4" /> Save Snapshot
+              </button>
+            </div>
         </div>
       </div>
     </div>

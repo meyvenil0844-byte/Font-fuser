@@ -411,22 +411,30 @@ const NEGATED_MATH_MAP = {
   0x2271: 0x2265, // ≱ -> ≥
 };
 
-process.on('message', (workerData) => {
+process.on('message', (workerData: any) => {
 try {
   let { glyphMap, baseFontId, serverFontIds, uploadDir } = workerData;
+  const os = require('os');
+  const defaultUploadDir = path.join(os.tmpdir ? os.tmpdir() : '/tmp', 'fontfuser-uploads');
+  uploadDir = uploadDir || defaultUploadDir;
+  if (!fs.existsSync(uploadDir)) {
+    try { fs.mkdirSync(uploadDir, { recursive: true }); } catch (e) {}
+  }
+
+  if (process.send) process.send({ type: 'progress', percent: 10, message: 'Parsing base font and glyph mappings...' });
   
-  let baseFontParsed = null;
+  let baseFontParsed: any = null;
+  const baseServerFilename = serverFontIds[baseFontId];
+  if (!baseServerFilename) throw new Error("Base font missing");
+  const baseFilePath = path.join(uploadDir, baseServerFilename);
+  if (!fs.existsSync(baseFilePath)) throw new Error("Base font file missing");
   {
-    const serverFilename = serverFontIds[baseFontId];
-    if (!serverFilename) throw new Error("Base font missing");
-    const filePath = path.join(uploadDir, serverFilename);
-    if (!fs.existsSync(filePath)) throw new Error("Base font file missing");
-    let buffer = fs.readFileSync(filePath);
+    let buffer = fs.readFileSync(baseFilePath);
     let ab = buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
     baseFontParsed = opentype.parse(ab);
-    buffer = null;
-    ab = null;
-    if (typeof global.gc === 'function') global.gc();
+    buffer = null as any;
+    ab = null as any;
+    if (typeof (global as any).gc === 'function') (global as any).gc();
   }
   
   // Cache for target fonts to avoid memory bloat
@@ -1102,40 +1110,71 @@ try {
     delete baseFontParsed.tables.loca;
   }
 
-  // COLOR UPDATE: Preserve and merge SVG in OpenType, COLR (COLRv0), CPAL, and CAPL font tables
+  // COLOR UPDATE: Preserve and merge SVG in OpenType, COLR (COLRv0), and CPAL font tables
   try {
-    let mergeColorTablesFn = null;
-    try {
-      mergeColorTablesFn = require('./src/lib/colorFontUtils.ts').mergeColorTables;
-    } catch (e1) {
+    function fontFileHasColor(fPath: string): boolean {
+      if (!fPath || !fs.existsSync(fPath)) return false;
       try {
-        mergeColorTablesFn = require('./src/lib/colorFontUtils').mergeColorTables;
-      } catch (e2) {}
+        const fd = fs.openSync(fPath, 'r');
+        const headBuf = Buffer.alloc(1024);
+        const bytesRead = fs.readSync(fd, headBuf, 0, 1024, 0);
+        fs.closeSync(fd);
+        if (bytesRead < 12) return false;
+        const numTables = headBuf.readUInt16BE(4);
+        for (let ti = 0; ti < numTables && 12 + ti * 16 + 4 <= bytesRead; ti++) {
+          const tag = headBuf.toString('ascii', 12 + ti * 16, 12 + ti * 16 + 4);
+          if (tag === 'COLR' || tag === 'CPAL' || tag === 'SVG ') return true;
+        }
+      } catch (e) {}
+      return false;
     }
-    if (mergeColorTablesFn) {
-      const allGlyphsList = [];
-      if (baseFontParsed.glyphs && baseFontParsed.glyphs.length) {
-        for (let gi = 0; gi < baseFontParsed.glyphs.length; gi++) {
-          allGlyphsList.push(baseFontParsed.glyphs.get(gi));
-        }
+
+    const baseHasColor = (baseFontParsed.tables && (baseFontParsed.tables.colr || baseFontParsed.tables.COLR || baseFontParsed.tables.cpal || baseFontParsed.tables.CPAL || baseFontParsed.tables.svg || baseFontParsed.tables.SVG)) || (baseServerFilename ? fontFileHasColor(path.join(uploadDir, baseServerFilename)) : false);
+
+    const targetIdsWithColor: string[] = [];
+    const usedTargetIds = new Set(Object.values(glyphMap || {}));
+    for (const tId of usedTargetIds) {
+      const sfn = serverFontIds[tId];
+      if (sfn && fontFileHasColor(path.join(uploadDir, sfn))) {
+        targetIdsWithColor.push(tId);
       }
-      const colorTablesMerged = mergeColorTablesFn(baseFontParsed, parsedFontsCache, glyphMap, allGlyphsList);
-      if (colorTablesMerged && colorTablesMerged.hasColor) {
-        if (colorTablesMerged.cpalTable) {
-          baseFontParsed.tables.cpal = colorTablesMerged.cpalTable;
-          baseFontParsed.tables.capl = colorTablesMerged.caplTable;
-          baseFontParsed.tables.CPAL = colorTablesMerged.cpalTable;
-          baseFontParsed.tables.CAPL = colorTablesMerged.caplTable;
-        }
-        if (colorTablesMerged.colrTable) {
-          baseFontParsed.tables.colr = colorTablesMerged.colrTable;
-          baseFontParsed.tables.COLR = colorTablesMerged.colrTable;
-        }
-        if (colorTablesMerged.svgTable) {
-          baseFontParsed.tables.svg = colorTablesMerged.svgTable;
-          baseFontParsed.tables.SVG = colorTablesMerged.svgTable;
-        }
+    }
+
+    if (baseHasColor || targetIdsWithColor.length > 0) {
+      if (process.send) process.send({ type: 'progress', percent: 71, message: 'Processing color OpenType tables (COLR / CPAL / SVG)...' });
+      let mergeColorTablesFn: any = null;
+      try {
+        mergeColorTablesFn = require('./src/lib/colorFontUtils.ts').mergeColorTables;
+      } catch (e1) {
+        try {
+          mergeColorTablesFn = require('./src/lib/colorFontUtils').mergeColorTables;
+        } catch (e2) {}
       }
+      if (mergeColorTablesFn) {
+        const targetFontsForColor = new Map();
+        for (const tId of targetIdsWithColor) {
+          const tf = getTargetFont(tId);
+          if (tf) targetFontsForColor.set(tId, tf);
+        }
+        const colorTablesMerged = mergeColorTablesFn(baseFontParsed, targetFontsForColor, glyphMap);
+        if (colorTablesMerged && colorTablesMerged.hasColor) {
+          if (colorTablesMerged.cpalTable) {
+            baseFontParsed.tables.cpal = colorTablesMerged.cpalTable;
+            baseFontParsed.tables.CPAL = colorTablesMerged.cpalTable;
+          }
+          if (colorTablesMerged.colrTable) {
+            baseFontParsed.tables.colr = colorTablesMerged.colrTable;
+            baseFontParsed.tables.COLR = colorTablesMerged.colrTable;
+          }
+          if (colorTablesMerged.svgTable) {
+            baseFontParsed.tables.svg = colorTablesMerged.svgTable;
+            baseFontParsed.tables.SVG = colorTablesMerged.svgTable;
+          }
+        }
+        targetFontsForColor.clear();
+      }
+    } else {
+      if (process.send) process.send({ type: 'progress', percent: 71, message: 'Verified OpenType tables (standard monochrome outlines)...' });
     }
   } catch (e) {
     console.warn("Color table merge warning in worker:", e);
@@ -1155,12 +1194,21 @@ try {
     global.gc(); // Double sweep
   }
   
+  if (typeof process.send === 'function') {
+    process.send({ type: 'progress', percent: 96, message: 'Generating final font buffer...' });
+  }
   const buffer = baseFontParsed.toArrayBuffer();
+  
+  if (typeof process.send === 'function') {
+    process.send({ type: 'progress', percent: 99, message: 'Writing final font file to disk...' });
+  }
   const outputFilename = 'FusedFont_' + Date.now() + '.otf';
   const outputPath = path.join(uploadDir, outputFilename);
   fs.writeFileSync(outputPath, Buffer.from(buffer));
   
-  process.send({ type: 'done', file: outputPath, originalName: 'FusedFont.otf' });
+  if (typeof process.send === 'function') {
+    process.send({ type: 'done', percent: 100, file: outputPath, originalName: 'FusedFont.otf' });
+  }
   setTimeout(() => process.exit(0), 100);
   
 } catch (err) {

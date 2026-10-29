@@ -8,6 +8,7 @@ export interface UploadedFont {
   fileName: string;
   file: File;
   buffer?: ArrayBuffer;
+  dataUrl?: string;
   parsed?: any;
   fontFamilyName: string; // Used for @font-face
   color: string;

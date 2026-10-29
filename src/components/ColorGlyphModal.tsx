@@ -208,7 +208,7 @@ export function ColorGlyphModal({
       const fontFamilyName = `FontFuser_${id}`;
 
       // Inject into DOM @font-face
-      const fontFace = new FontFace(fontFamilyName, buffer);
+      const fontFace = new FontFace(fontFamilyName, buffer.slice(0));
       try {
         await fontFace.load();
         document.fonts.add(fontFace);
@@ -222,6 +222,7 @@ export function ColorGlyphModal({
         name: `${fontName} (Color)`,
         fileName,
         file: fontFile,
+        buffer: buffer.slice(0),
         parsed: font,
         fontFamilyName,
         color: primaryColor,

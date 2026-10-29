@@ -31,18 +31,25 @@ function applyPatches(filePath = 'node_modules/opentype.js/dist/opentype.js') {
   }`;
 
     const checksumReplace = `  function computeCheckSum(bytes) {
-    let padding = 0;
-    while ((bytes.length + padding) % 4 !== 0) padding++;
-    
     let sum = 0;
-    for (let i = 0; i < bytes.length; i += 4) {
-      let b0 = bytes[i] || 0;
-      let b1 = bytes[i + 1] || 0;
-      let b2 = bytes[i + 2] || 0;
-      let b3 = bytes[i + 3] || 0;
-      sum += (b0 << 24) + (b1 << 16) + (b2 << 8) + b3;
+    const len = (bytes && bytes.length) ? bytes.length : 0;
+    const fullWords = (len >> 2) << 2;
+    if (typeof Buffer !== 'undefined' && Buffer.isBuffer(bytes)) {
+      for (let i = 0; i < fullWords; i += 4) {
+        sum = (sum + bytes.readUInt32BE(i)) >>> 0;
+      }
+    } else {
+      for (let i = 0; i < fullWords; i += 4) {
+        sum = (sum + ((bytes[i] << 24) >>> 0) + (bytes[i + 1] << 16) + (bytes[i + 2] << 8) + bytes[i + 3]) >>> 0;
+      }
     }
-    sum %= Math.pow(2, 32);
+    if (len > fullWords) {
+      let b0 = bytes[fullWords] || 0;
+      let b1 = bytes[fullWords + 1] || 0;
+      let b2 = bytes[fullWords + 2] || 0;
+      let b3 = bytes[fullWords + 3] || 0;
+      sum = (sum + ((b0 << 24) >>> 0) + (b1 << 16) + (b2 << 8) + b3) >>> 0;
+    }
     return sum;
   }`;
     if (code.includes(checksumTarget)) {
@@ -130,7 +137,22 @@ function applyPatches(filePath = 'node_modules/opentype.js/dist/opentype.js') {
         const enc = val.encode();
         b = (typeof Buffer !== 'undefined') ? Buffer.from(enc) : (enc instanceof Uint8Array ? enc : new Uint8Array(enc));
       }
-      else if (val) b = (typeof Buffer !== 'undefined') ? Buffer.from(val) : (val instanceof Uint8Array ? val : new Uint8Array(val));
+      else if (typeof val === "number") {
+        b = (typeof Buffer !== 'undefined') ? Buffer.from([val & 0xFF]) : new Uint8Array([val & 0xFF]);
+      }
+      else if (val) {
+        if (typeof Buffer !== 'undefined') {
+          if (Buffer.isBuffer(val)) b = val;
+          else if (val instanceof Uint8Array) b = Buffer.from(val.buffer, val.byteOffset, val.byteLength);
+          else if (typeof val === 'string') b = Buffer.from(val, 'utf8');
+          else if (Array.isArray(val)) b = Buffer.from(val);
+          else {
+            try { b = Buffer.from(val); } catch (e) { b = Buffer.from([Number(val) & 0xFF || 0]); }
+          }
+        } else {
+          b = val instanceof Uint8Array ? val : new Uint8Array([Number(val) & 0xFF || 0]);
+        }
+      }
       else b = (typeof Buffer !== 'undefined') ? Buffer.alloc(0) : new Uint8Array(0);
       chunks[i + 1] = b;
       dataLength += b.length;
@@ -245,7 +267,192 @@ function applyPatches(filePath = 'node_modules/opentype.js/dist/opentype.js') {
         console.log("Added RAW_BYTES encoder");
     }
 
-    // 5. Patch makeCharStringsIndex for precompiled _rawCharString and path.commands freeing
+    // 4b. Patch encode.TABLE and sizeOf.TABLE for high-speed Buffer streaming & caching (no d.push loops)
+    const encodeTableTarget = code.includes('  encode.TABLE = function(table) {') ? '  encode.TABLE = function(table) {' : (code.includes('encode.TABLE = function(table) {') ? 'encode.TABLE = function(table) {' : null);
+    const encodeTableEnd = code.includes('  encode.LITERAL = function(v) {') ? '  encode.LITERAL = function(v) {' : (code.includes('encode.LITERAL = function(v) {') ? 'encode.LITERAL = function(v) {' : null);
+    if (encodeTableTarget && encodeTableEnd && code.includes(encodeTableTarget) && code.includes(encodeTableEnd)) {
+        const s = code.indexOf(encodeTableTarget);
+        const e = code.indexOf(encodeTableEnd, s);
+        const encodeTableReplacement = `encode.TABLE = function(table) {
+    if (table && table._cachedEncodedBytes) {
+      return table._cachedEncodedBytes;
+    }
+    const length = (table.fields || []).length;
+    const chunks = [];
+    const subtables = [];
+    const subtableOffsets = [];
+    let currentLen = 0;
+
+    for (let i = 0; i < length; i += 1) {
+      const field = table.fields[i];
+      const encodingFunction = encode[field.type];
+      check_default.argument(encodingFunction !== void 0, "No encoding function for field type " + field.type + " (" + field.name + ")");
+      let value = table[field.name];
+      if (value === void 0) {
+        value = field.value;
+      }
+      let bytes = encodingFunction(value);
+      if (field.type === "TABLE") {
+        if (value.fields !== null) {
+          subtableOffsets.push(currentLen);
+          subtables.push(bytes);
+        }
+        chunks.push(new Uint8Array([0, 0]));
+        currentLen += 2;
+      } else {
+        if (typeof Buffer !== 'undefined' && Buffer.isBuffer(bytes)) {
+          chunks.push(bytes);
+          currentLen += bytes.length;
+        } else if (bytes instanceof Uint8Array) {
+          chunks.push(bytes);
+          currentLen += bytes.length;
+        } else if (Array.isArray(bytes)) {
+          const u8 = (typeof Buffer !== 'undefined' && Buffer.from) ? Buffer.from(bytes) : new Uint8Array(bytes);
+          chunks.push(u8);
+          currentLen += u8.length;
+        } else if (typeof bytes === 'number') {
+          chunks.push(new Uint8Array([bytes & 0xFF]));
+          currentLen += 1;
+        } else if (bytes && typeof bytes.length === 'number') {
+          const u8 = (typeof Buffer !== 'undefined' && Buffer.from) ? Buffer.from(bytes) : new Uint8Array(bytes);
+          chunks.push(u8);
+          currentLen += u8.length;
+        }
+      }
+    }
+
+    let flat;
+    if (subtables.length === 0) {
+      if (typeof Buffer !== 'undefined' && Buffer.concat) {
+        flat = Buffer.concat(chunks.map(c => Buffer.isBuffer(c) ? c : Buffer.from(c.buffer || c, c.byteOffset || 0, c.byteLength || c.length)));
+      } else {
+        flat = new Uint8Array(currentLen);
+        let pos = 0;
+        for (let i = 0; i < chunks.length; i++) {
+          flat.set(chunks[i], pos);
+          pos += chunks[i].length;
+        }
+      }
+    } else {
+      let totalLen = currentLen;
+      for (let i = 0; i < subtables.length; i++) {
+        totalLen += subtables[i].length;
+      }
+      flat = (typeof Buffer !== 'undefined' && Buffer.allocUnsafe) ? Buffer.allocUnsafe(totalLen) : new Uint8Array(totalLen);
+      let pos = 0;
+      for (let i = 0; i < chunks.length; i++) {
+        flat.set(chunks[i], pos);
+        pos += chunks[i].length;
+      }
+      for (let i = 0; i < subtables.length; i += 1) {
+        const o = subtableOffsets[i];
+        const offset = pos;
+        check_default.argument(offset < 65536, "Table " + table.tableName + " too big.");
+        flat[o] = (offset >> 8) & 0xFF;
+        flat[o + 1] = offset & 0xFF;
+        flat.set(subtables[i], pos);
+        pos += subtables[i].length;
+      }
+    }
+
+    if (table && typeof table === 'object') {
+      table._cachedEncodedBytes = flat;
+    }
+    return flat;
+  };
+  sizeOf.TABLE = function(table) {
+    if (table && table._cachedEncodedBytes) {
+      return table._cachedEncodedBytes.length;
+    }
+    let numBytes = 0;
+    const length = (table.fields || []).length;
+    for (let i = 0; i < length; i += 1) {
+      const field = table.fields[i];
+      const sizeOfFunction = sizeOf[field.type];
+      check_default.argument(sizeOfFunction !== void 0, "No sizeOf function for field type " + field.type + " (" + field.name + ")");
+      let value = table[field.name];
+      if (value === void 0) {
+        value = field.value;
+      }
+      numBytes += sizeOfFunction(value);
+      if (field.type === "TABLE") {
+        numBytes += 2;
+      }
+    }
+    return numBytes;
+  };
+  encode.RECORD = encode.TABLE;
+  sizeOf.RECORD = sizeOf.TABLE;
+  `;
+        code = code.slice(0, s) + encodeTableReplacement + code.slice(e);
+        console.log("Patched encode.TABLE and sizeOf.TABLE in " + filePath);
+    }
+
+    // 4c. Patch makeSfntTable for RAW_BYTES fast table embedding and heartbeat
+    const makeSfntTarget = code.includes('  function makeSfntTable(tables) {') ? '  function makeSfntTable(tables) {' : (code.includes('function makeSfntTable(tables) {') ? 'function makeSfntTable(tables) {' : null);
+    const makeSfntEnd = code.includes('  function metricsForChar(') ? '  function metricsForChar(' : (code.includes('function metricsForChar(') ? 'function metricsForChar(' : null);
+    if (makeSfntTarget && makeSfntEnd && code.includes(makeSfntTarget) && code.includes(makeSfntEnd)) {
+        const s = code.indexOf(makeSfntTarget);
+        const e = code.indexOf(makeSfntEnd, s);
+        const makeSfntReplacement = `function makeSfntTable(tables) {
+    if (typeof process !== 'undefined' && typeof process.send === 'function') {
+      try {
+        process.send({ type: 'progress', percent: 97, message: 'Assembling SFNT font tables...' });
+      } catch (err) {}
+    }
+    const sfnt = new table_default.Table("sfnt", [
+      { name: "version", type: "TAG", value: "OTTO" },
+      { name: "numTables", type: "USHORT", value: 0 },
+      { name: "searchRange", type: "USHORT", value: 0 },
+      { name: "entrySelector", type: "USHORT", value: 0 },
+      { name: "rangeShift", type: "USHORT", value: 0 }
+    ]);
+    sfnt.tables = tables;
+    sfnt.numTables = tables.length;
+    const highestPowerOf2 = Math.pow(2, log2(sfnt.numTables));
+    sfnt.searchRange = 16 * highestPowerOf2;
+    sfnt.entrySelector = log2(highestPowerOf2);
+    sfnt.rangeShift = sfnt.numTables * 16 - sfnt.searchRange;
+    const recordFields = [];
+    const tableFields = [];
+    let offset = sfnt.sizeOf() + makeTableRecord().sizeOf() * sfnt.numTables;
+    while (offset % 4 !== 0) {
+      offset += 1;
+      tableFields.push({ name: "padding", type: "BYTE", value: 0 });
+    }
+    for (let i = 0; i < tables.length; i += 1) {
+      const t = tables[i];
+      check_default.argument(t.tableName.length === 4, "Table name" + t.tableName + " is invalid.");
+      const tBytes = (t && t._cachedEncodedBytes) ? t._cachedEncodedBytes : t.encode();
+      if (t) t._cachedEncodedBytes = tBytes;
+      const tableLength = tBytes.length;
+      const tableRecord = makeTableRecord(t.tableName, computeCheckSum(tBytes), offset, tableLength);
+      recordFields.push({ name: tableRecord.tag + " Table Record", type: "RECORD", value: tableRecord });
+      tableFields.push({ name: t.tableName + " table", type: "RAW_BYTES", value: tBytes });
+      offset += tableLength;
+      check_default.argument(!isNaN(offset), "Something went wrong calculating the offset.");
+      while (offset % 4 !== 0) {
+        offset += 1;
+        tableFields.push({ name: "padding", type: "BYTE", value: 0 });
+      }
+    }
+    recordFields.sort(function(r1, r2) {
+      if (r1.value.tag > r2.value.tag) {
+        return 1;
+      } else {
+        return -1;
+      }
+    });
+    sfnt.fields = sfnt.fields.concat(recordFields);
+    sfnt.fields = sfnt.fields.concat(tableFields);
+    return sfnt;
+  }
+  `;
+        code = code.slice(0, s) + makeSfntReplacement + code.slice(e);
+        console.log("Patched makeSfntTable in " + filePath);
+    }
+
+    // 5. Patch makeCharStringsIndex for precompiled _rawCharString, path.commands freeing, and progress reporting
     const makeCharStringsIndexTarget = `function makeCharStringsIndex(glyphs, version) {`;
     const makePrivateDictTarget = `function makePrivateDict(attrs, strings, version) {`;
     
@@ -253,24 +460,61 @@ function applyPatches(filePath = 'node_modules/opentype.js/dist/opentype.js') {
     const t = new table_default.Record("CharStrings INDEX", [
       { name: "charStrings", type: "INDEX", value: [] }
     ]);
-    for (let i = 0; i < glyphs.length; i += 1) {
-      const glyph = glyphs.get(i);
-      let buf;
-      if (glyph._rawCharString) {
-        buf = glyph._rawCharString;
-      } else {
-        let ops = glyphToOps(glyph, version);
-        buf = encode.CHARSTRING(ops);
-        ops = null;
-        glyph._rawCharString = buf;
-        if (glyph.path) {
+    const totalGlyphs = glyphs.length;
+    const progressStep = Math.max(25, Math.floor(totalGlyphs / 50));
+    for (let i = 0; i < totalGlyphs; i += 1) {
+      let glyph = null;
+      try {
+        glyph = glyphs.get(i);
+      } catch (e) {}
+      if (!glyph) {
+        glyph = new Glyph({ name: i === 0 ? ".notdef" : ("glyph" + i), advanceWidth: 500 });
+      }
+      let buf = glyph._rawCharString;
+      if (!buf) {
+        try {
+          let ops = glyphToOps(glyph, version);
+          buf = encode.CHARSTRING(ops);
+          ops = null;
+          glyph._rawCharString = buf;
+        } catch (err) {
+          try {
+            const fallbackOps = [
+              { name: "width", type: "NUMBER", value: (glyph.advanceWidth || 500) },
+              { name: "endchar", type: "OP", value: 14 }
+            ];
+            buf = encode.CHARSTRING(fallbackOps);
+            glyph._rawCharString = buf;
+          } catch (e2) {
+            buf = (typeof Buffer !== 'undefined' && Buffer.from) ? Buffer.from([139, 14]) : new Uint8Array([139, 14]);
+            glyph._rawCharString = buf;
+          }
+        }
+        if (glyph.path && Array.isArray(glyph.path.commands)) {
           glyph.path.commands = [];
         }
       }
-      t.charStrings.push({ name: glyph.name, type: "RAW_BYTES", value: buf });
-      if (i % 2000 === 0 && typeof globalThis !== 'undefined' && typeof globalThis.gc === 'function') {
-        globalThis.gc();
+      const safeName = glyph.name || (i === 0 ? ".notdef" : ("glyph" + i));
+      t.charStrings.push({ name: safeName, type: "RAW_BYTES", value: buf });
+      if ((i % progressStep === 0 || i === totalGlyphs - 1) && typeof process !== 'undefined' && typeof process.send === 'function') {
+        const pct = 72 + Math.round((i / Math.max(1, totalGlyphs)) * 22);
+        try {
+          process.send({
+            type: 'progress',
+            percent: pct,
+            message: 'Generating final font buffer: ' + i + ' / ' + totalGlyphs + ' glyphs (' + Math.round((i / Math.max(1, totalGlyphs)) * 100) + '%)'
+          });
+        } catch (e) {}
       }
+    }
+    if (typeof process !== 'undefined' && typeof process.send === 'function') {
+      try {
+        process.send({
+          type: 'progress',
+          percent: 96,
+          message: 'All glyph charstrings compiled. Assembling SFNT tables...'
+        });
+      } catch (e) {}
     }
     return t;
   }
@@ -283,10 +527,33 @@ function applyPatches(filePath = 'node_modules/opentype.js/dist/opentype.js') {
         console.log("Patched makeCharStringsIndex");
     }
 
-    // 6. Patch Glyph.prototype.getMetrics to cache and compute inline
-    const getMetricsTarget = code.includes('  Glyph.prototype.getMetrics = function() {') ? '  Glyph.prototype.getMetrics = function() {' : 'Glyph.prototype.getMetrics = function() {';
-    const getMetricsSectionEnd = code.includes('  Glyph.prototype.getBoundingBox = function() {') ? '  Glyph.prototype.getBoundingBox = function() {' : (code.includes('Glyph.prototype.getBoundingBox = function() {') ? 'Glyph.prototype.getBoundingBox = function() {' : 'Glyph.prototype.draw = function(ctx, x, y, fontSize, options) {');
-    
+    // 5b. Patch decode.UTF8 and decode.UTF16 to avoid String.fromCharCode.apply call stack overflow
+    const utfDecodeTarget = 'decode.UTF8 = function(data, offset, numBytes) {';
+    const utfDecodeEnd = 'encode.UTF16 = function(v) {';
+    if (code.includes(utfDecodeTarget) && code.includes(utfDecodeEnd)) {
+        const s = code.indexOf(utfDecodeTarget);
+        const e = code.indexOf(utfDecodeEnd, s);
+        const utfDecodeReplacement = `decode.UTF8 = function(data, offset, numBytes) {
+    let str = "";
+    for (let j = 0; j < numBytes; j++, offset += 1) {
+      str += String.fromCharCode(data.getUint8(offset));
+    }
+    return str;
+  };
+  decode.UTF16 = function(data, offset, numBytes) {
+    let str = "";
+    const numChars = numBytes / 2;
+    for (let j = 0; j < numChars; j++, offset += 2) {
+      str += String.fromCharCode(data.getUint16(offset));
+    }
+    return str;
+  };
+  `;
+        code = code.slice(0, s) + utfDecodeReplacement + code.slice(e);
+        console.log("Patched decode.UTF8 and decode.UTF16 in " + filePath);
+    }
+
+    // 6. Patch Glyph.prototype.getMetrics to cache and compute inline (all occurrences)
     const getMetricsReplacement = `  Glyph.prototype.getMetrics = function() {
     if (this._cachedMetrics) return this._cachedMetrics;
     const path = this.path;
@@ -310,7 +577,7 @@ function applyPatches(filePath = 'node_modules/opentype.js/dist/opentype.js') {
       if (cmd.type === "Q" || cmd.type === "C") {
         const x1 = cmd.x1, y1 = cmd.y1;
         if (x1 < xMin) xMin = x1; if (x1 > xMax) xMax = x1;
-        if (y1 < yMin) yMin = y1; if (y1 > yMax) yMax = y;
+        if (y1 < yMin) yMin = y1; if (y1 > yMax) yMax = y1;
       }
       if (cmd.type === "C") {
         const x2 = cmd.x2, y2 = cmd.y2;
@@ -333,20 +600,43 @@ function applyPatches(filePath = 'node_modules/opentype.js/dist/opentype.js') {
   };
   `;
 
+    const getMetricsTarget = code.includes('  Glyph.prototype.getMetrics = function() {') ? '  Glyph.prototype.getMetrics = function() {' : 'Glyph.prototype.getMetrics = function() {';
+    const getMetricsSectionEnd = code.includes('  Glyph.prototype.getBoundingBox = function() {') ? '  Glyph.prototype.getBoundingBox = function() {' : (code.includes('Glyph.prototype.getBoundingBox = function() {') ? 'Glyph.prototype.getBoundingBox = function() {' : 'Glyph.prototype.draw = function(ctx, x, y, fontSize, options) {');
+
     if (code.includes(getMetricsTarget) && code.includes(getMetricsSectionEnd)) {
         const start = code.indexOf(getMetricsTarget);
         const end = code.indexOf(getMetricsSectionEnd);
         code = code.slice(0, start) + getMetricsReplacement + code.slice(end);
-        console.log("Patched Glyph.prototype.getMetrics in " + filePath);
+        console.log("Patched first Glyph.prototype.getMetrics in " + filePath);
     }
 
-    // 7. Patch Font.prototype.toArrayBuffer for zero-copy ArrayBuffer extraction
+    // Patch second Glyph.prototype.getMetrics definition that overrides the first
+    const secondGetMetricsTarget = code.includes('  Glyph.prototype.getMetrics = function() {') ? '  Glyph.prototype.getMetrics = function() {' : 'Glyph.prototype.getMetrics = function() {';
+    const secondGetMetricsEnd = code.includes('  Glyph.prototype.draw = function(ctx') ? '  Glyph.prototype.draw = function(ctx' : 'Glyph.prototype.draw = function(ctx';
+    if (code.includes(secondGetMetricsTarget) && code.includes(secondGetMetricsEnd)) {
+        const s = code.indexOf(secondGetMetricsTarget);
+        const e = code.indexOf(secondGetMetricsEnd, s);
+        code = code.slice(0, s) + getMetricsReplacement + code.slice(e);
+        console.log("Patched second Glyph.prototype.getMetrics in " + filePath);
+    }
+
+    // 7. Patch Font.prototype.toArrayBuffer for zero-copy ArrayBuffer extraction & fast single-pass encode
     const toArrayBufferTarget = code.includes('  Font.prototype.toArrayBuffer = function() {') ? '  Font.prototype.toArrayBuffer = function() {' : 'Font.prototype.toArrayBuffer = function() {';
     const toArrayBufferSectionEnd = code.includes('  Font.prototype.download = function() {') ? '  Font.prototype.download = function() {' : 'Font.prototype.download = function() {';
     
     const toArrayBufferReplacement = `  Font.prototype.toArrayBuffer = function() {
+    if (typeof process !== 'undefined' && typeof process.send === 'function') {
+      try {
+        process.send({ type: 'progress', percent: 72, message: 'Encoding font binary tables...' });
+      } catch (e) {}
+    }
     const sfntTable = this.toTables();
-    const bytes = sfntTable.encode();
+    if (typeof process !== 'undefined' && typeof process.send === 'function') {
+      try {
+        process.send({ type: 'progress', percent: 98, message: 'Finalizing font ArrayBuffer...' });
+      } catch (e) {}
+    }
+    const bytes = (sfntTable && sfntTable._finalBytes) ? sfntTable._finalBytes : sfntTable.encode();
     if (typeof Buffer !== 'undefined') {
       const buf = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes);
       return buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
@@ -363,71 +653,85 @@ function applyPatches(filePath = 'node_modules/opentype.js/dist/opentype.js') {
         console.log("Patched Font.prototype.toArrayBuffer in " + filePath);
     }
 
-    // 8. Patch fontToSfntTable globals to avoid Math.min/max stack overflow
-    const sfntGlobalsTarget = `    const globals = {
-      xMin: Math.min.apply(null, xMins),
-      yMin: Math.min.apply(null, yMins),
-      xMax: Math.max.apply(null, xMaxs),
-      yMax: Math.max.apply(null, yMaxs),
-      advanceWidthMax: Math.max.apply(null, advanceWidths),
-      advanceWidthAvg: average(advanceWidths),
-      minLeftSideBearing: Math.min.apply(null, leftSideBearings),
-      maxLeftSideBearing: Math.max.apply(null, leftSideBearings),
-      minRightSideBearing: Math.min.apply(null, rightSideBearings)
-    };`;
-
-    const sfntGlobalsReplace = `    function _arrMin(arr) {
-      let m = Infinity;
-      for (let i = 0; i < arr.length; i++) { if (arr[i] < m) m = arr[i]; }
-      return m;
-    }
-    function _arrMax(arr) {
-      let m = -Infinity;
-      for (let i = 0; i < arr.length; i++) { if (arr[i] > m) m = arr[i]; }
-      return m;
+    // 8. Patch fontToSfntTable metrics accumulation to use zero arrays and running variables
+    const fontToSfntStartTarget = 'function fontToSfntTable(font) {';
+    const fontToSfntHeadTarget = 'const headTable = head_default.make({';
+    if (code.includes(fontToSfntStartTarget) && code.includes(fontToSfntHeadTarget)) {
+        const s = code.indexOf(fontToSfntStartTarget);
+        const e = code.indexOf(fontToSfntHeadTarget, s);
+        const replSfnt = `function fontToSfntTable(font) {
+    let g_xMin = Infinity, g_yMin = Infinity, g_xMax = -Infinity, g_yMax = -Infinity;
+    let g_advMax = 0, g_advSum = 0, g_advCount = 0;
+    let g_minLsb = Infinity, g_maxLsb = -Infinity, g_minRsb = Infinity;
+    let firstCharIndex;
+    let lastCharIndex = 0;
+    let ulUnicodeRange1 = 0;
+    let ulUnicodeRange2 = 0;
+    let ulUnicodeRange3 = 0;
+    let ulUnicodeRange4 = 0;
+    for (let i = 0; i < font.glyphs.length; i += 1) {
+      const glyph = font.glyphs.get(i);
+      const unicode = glyph.unicode | 0;
+      if (isNaN(glyph.advanceWidth)) {
+        glyph.advanceWidth = 500;
+      }
+      if (firstCharIndex > unicode || firstCharIndex === void 0) {
+        if (unicode > 0) {
+          firstCharIndex = unicode;
+        }
+      }
+      if (lastCharIndex < unicode) {
+        lastCharIndex = unicode;
+      }
+      const position = os2_default.getUnicodeRange(unicode);
+      if (position < 32) {
+        ulUnicodeRange1 |= 1 << position;
+      } else if (position < 64) {
+        ulUnicodeRange2 |= 1 << (position - 32);
+      } else if (position < 96) {
+        ulUnicodeRange3 |= 1 << (position - 64);
+      } else if (position < 123) {
+        ulUnicodeRange4 |= 1 << (position - 96);
+      }
+      const advW = glyph.advanceWidth || 0;
+      g_advSum += advW;
+      g_advCount++;
+      if (advW > g_advMax) g_advMax = advW;
+      if (glyph.name !== ".notdef") {
+        const metrics = glyph.getMetrics();
+        if (metrics.xMin < g_xMin) g_xMin = metrics.xMin;
+        if (metrics.yMin < g_yMin) g_yMin = metrics.yMin;
+        if (metrics.xMax > g_xMax) g_xMax = metrics.xMax;
+        if (metrics.yMax > g_yMax) g_yMax = metrics.yMax;
+        if (metrics.leftSideBearing < g_minLsb) g_minLsb = metrics.leftSideBearing;
+        if (metrics.leftSideBearing > g_maxLsb) g_maxLsb = metrics.leftSideBearing;
+        if (metrics.rightSideBearing < g_minRsb) g_minRsb = metrics.rightSideBearing;
+      }
     }
     const globals = {
-      xMin: _arrMin(xMins),
-      yMin: _arrMin(yMins),
-      xMax: _arrMax(xMaxs),
-      yMax: _arrMax(yMaxs),
-      advanceWidthMax: _arrMax(advanceWidths),
-      advanceWidthAvg: average(advanceWidths),
-      minLeftSideBearing: _arrMin(leftSideBearings),
-      maxLeftSideBearing: _arrMax(leftSideBearings),
-      minRightSideBearing: _arrMin(rightSideBearings)
-    };`;
-
-    // 8. Patch sfntGlobals calculation to avoid full font bounding box expansion from outlier glyphs
-    const sfntGlobalsRegex = /([ \t]*)const globals = \{[\s\S]*?minRightSideBearing: Math\.min\.apply\(null, rightSideBearings\)[\s\S]*?\};/;
-    const sfntGlobalsMatch = code.match(sfntGlobalsRegex);
-    if (sfntGlobalsMatch) {
-        const ind = sfntGlobalsMatch[1] || '    ';
-        const sfntGlobalsReplace = `${ind}function _arrMin(arr) {
-${ind}  let m = Infinity;
-${ind}  for (let i = 0; i < arr.length; i++) { if (arr[i] < m) m = arr[i]; }
-${ind}  return m;
-${ind}}
-${ind}function _arrMax(arr) {
-${ind}  let m = -Infinity;
-${ind}  for (let i = 0; i < arr.length; i++) { if (arr[i] > m) m = arr[i]; }
-${ind}  return m;
-${ind}}
-${ind}const globals = {
-${ind}  xMin: _arrMin(xMins),
-${ind}  yMin: _arrMin(yMins),
-${ind}  xMax: _arrMax(xMaxs),
-${ind}  yMax: _arrMax(yMaxs),
-${ind}  advanceWidthMax: _arrMax(advanceWidths),
-${ind}  advanceWidthAvg: average(advanceWidths),
-${ind}  minLeftSideBearing: _arrMin(leftSideBearings),
-${ind}  maxLeftSideBearing: _arrMax(leftSideBearings),
-${ind}  minRightSideBearing: _arrMin(rightSideBearings)
-${ind}};`;
-        code = code.replace(sfntGlobalsRegex, sfntGlobalsReplace);
-        console.log("Patched sfntGlobals in " + filePath);
+      xMin: isFinite(g_xMin) ? g_xMin : 0,
+      yMin: isFinite(g_yMin) ? g_yMin : 0,
+      xMax: isFinite(g_xMax) ? g_xMax : (font.unitsPerEm || 1000),
+      yMax: isFinite(g_yMax) ? g_yMax : (font.ascender || 800),
+      advanceWidthMax: g_advMax || Math.round((font.unitsPerEm || 1000) * 0.6),
+      advanceWidthAvg: g_advCount > 0 ? (g_advSum / g_advCount) : 500,
+      minLeftSideBearing: isFinite(g_minLsb) ? g_minLsb : 0,
+      maxLeftSideBearing: isFinite(g_maxLsb) ? g_maxLsb : 0,
+      minRightSideBearing: isFinite(g_minRsb) ? g_minRsb : 0
+    };
+    globals.ascender = font.ascender;
+    globals.descender = font.descender;
+    let macStyle = 0;
+    if (font.weightClass >= 600) {
+      macStyle |= font.macStyleValues.BOLD;
     }
-
+    if (font.italicAngle < 0) {
+      macStyle |= font.macStyleValues.ITALIC;
+    }
+    `;
+        code = code.slice(0, s) + replSfnt + code.slice(e);
+        console.log("Patched fontToSfntTable running metrics in " + filePath);
+    }
     // 9. Patch font table pipeline for 100% Windows font installation validity
     const hheaOs2Regex = /(createdTimestamp: font\.createdTimestamp\s*\}\);\n)([\s\S]*?)(const sfntTable = makeSfntTable\(tables\);)/;
     const hheaOs2Match = code.match(hheaOs2Regex);

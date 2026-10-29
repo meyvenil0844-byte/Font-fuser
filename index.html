@@ -9,11 +9,95 @@
     <meta property="og:description" content="Fuse multiple fonts by swapping Unicode characters and categories into a custom TTF." />
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+Duployan&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+Duployan&family=Noto+Znamenny+Musical+Notation&display=swap" rel="stylesheet">
     <script>
       if (typeof global === 'undefined') {
         window.global = window;
       }
+      (function() {
+        function shouldSuppress(msg, stk, fn) {
+          msg = typeof msg === 'string' ? msg : '';
+          stk = typeof stk === 'string' ? stk : '';
+          fn = typeof fn === 'string' ? fn : '';
+          return msg.indexOf('WebSocket') !== -1 ||
+                 msg.indexOf('websocket') !== -1 ||
+                 stk.indexOf('@vite/client') !== -1 ||
+                 fn.indexOf('@vite/client') !== -1 ||
+                 msg.indexOf('vite-hmr') !== -1;
+        }
+
+        window.addEventListener('unhandledrejection', function(e) {
+          var msg = (e.reason && (e.reason.message || String(e.reason))) || '';
+          var stk = (e.reason && e.reason.stack) || '';
+          if (shouldSuppress(msg, stk, '')) {
+            e.preventDefault();
+            if (typeof e.stopImmediatePropagation === 'function') e.stopImmediatePropagation();
+          }
+        });
+
+        window.addEventListener('error', function(e) {
+          var msg = e.message || '';
+          var stk = (e.error && e.error.stack) || '';
+          var fn = e.filename || '';
+          if (shouldSuppress(msg, stk, fn)) {
+            e.preventDefault();
+            if (typeof e.stopImmediatePropagation === 'function') e.stopImmediatePropagation();
+          }
+        });
+
+        // Mock WebSocket implementation for Vite dev client in iFrame
+        function MockWebSocket(url, protocols) {
+          var self = this;
+          this.url = typeof url === 'string' ? url : '';
+          this.protocol = Array.isArray(protocols) ? protocols[0] : (protocols || 'vite-hmr');
+          this.readyState = 1; // 1 = OPEN
+          this.binaryType = 'blob';
+          this.bufferedAmount = 0;
+          this.extensions = '';
+          this.onopen = null;
+          this.onclose = null;
+          this.onerror = null;
+          this.onmessage = null;
+
+          var listeners = {};
+          this.addEventListener = function(event, cb) {
+            if (!listeners[event]) listeners[event] = [];
+            listeners[event].push(cb);
+            if (event === 'open') {
+              setTimeout(function() {
+                if (typeof cb === 'function') cb({ type: 'open', target: self });
+                if (typeof self.onopen === 'function') self.onopen({ type: 'open', target: self });
+              }, 0);
+            }
+          };
+          this.removeEventListener = function(event, cb) {
+            if (listeners[event]) {
+              listeners[event] = listeners[event].filter(function(fn) { return fn !== cb; });
+            }
+          };
+          this.dispatchEvent = function() { return true; };
+          this.send = function() {};
+          this.close = function(code, reason) {
+            self.readyState = 3;
+            var closeEvt = { type: 'close', wasClean: true, code: code || 1000, reason: reason || '', target: self };
+            if (typeof self.onclose === 'function') self.onclose(closeEvt);
+            if (listeners['close']) {
+              listeners['close'].forEach(function(fn) { fn(closeEvt); });
+            }
+          };
+        }
+
+        MockWebSocket.CONNECTING = 0;
+        MockWebSocket.OPEN = 1;
+        MockWebSocket.CLOSING = 2;
+        MockWebSocket.CLOSED = 3;
+        MockWebSocket.prototype.CONNECTING = 0;
+        MockWebSocket.prototype.OPEN = 1;
+        MockWebSocket.prototype.CLOSING = 2;
+        MockWebSocket.prototype.CLOSED = 3;
+
+        window.WebSocket = MockWebSocket;
+      })();
     </script>
   </head>
   <body>

@@ -1,13 +1,14 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Download, Layers, Loader2, SaveAll, Undo2, Redo2, History, CheckCircle2, X, ShieldCheck, Type, Palette, Upload, RotateCcw, Trash2, AlertCircle, Check } from 'lucide-react';
+import { Download, Layers, Loader2, SaveAll, Undo2, Redo2, History, CheckCircle2, X, ShieldCheck, Type, Palette, Upload, RotateCcw, Trash2, AlertCircle, Check, Zap, FileDown } from 'lucide-react';
 import { FontManager } from './components/FontManager';
-import { UnicodeExplorer } from './components/UnicodeExplorer';
+import { UnicodeExplorer, getBlockIndexForCodepoint } from './components/UnicodeExplorer';
 import { SavesModal } from './components/SavesModal';
+import { SaveToTtfModal } from './components/SaveToTtfModal';
 import { TypeTesterModal } from './components/TypeTesterModal';
 import { ColorTablesModal } from './components/ColorTablesModal';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { generateFusedFont, downloadArrayBuffer, safeStringFromCodePoint } from './lib/fontUtils';
-import { saveWorkspace, loadWorkspace, clearWorkspace, registerFontBuffer } from './lib/workspace';
+import { saveWorkspace, loadWorkspace, clearWorkspace, registerFontBuffer, type RestoreProgress } from './lib/workspace';
 import { UNICODE_BLOCKS } from './lib/unicodeBlocks';
 import { loadFontFiles, type FontLoadingProgress } from './lib/fontLoader';
 import type { UploadedFont, GlyphMapping } from './types';
@@ -17,11 +18,15 @@ export default function App() {
   const [glyphMap, setGlyphMap] = useState<GlyphMapping>({});
   const [isGenerating, setIsGenerating] = useState(false);
   const [progressMsg, setProgressMsg] = useState('');
+  const [progressPercent, setProgressPercent] = useState<number>(0);
 
   const [isWorkspaceLoading, setIsWorkspaceLoading] = useState(false);
   const [isRestoringWorkspace, setIsRestoringWorkspace] = useState(false);
+  const [restoreProgress, setRestoreProgress] = useState<RestoreProgress | null>(null);
   const [saveStatus, setSaveStatus] = useState<'saved' | 'saving' | 'error' | 'idle'>('idle');
   const [isSavesModalOpen, setIsSavesModalOpen] = useState(false);
+  const [isSaveToTtfOpen, setIsSaveToTtfOpen] = useState(false);
+  const [saveToTtfTargetProject, setSaveToTtfTargetProject] = useState<{ id?: string; name?: string } | null>(null);
   const [isTypeTesterOpen, setIsTypeTesterOpen] = useState(false);
   const [isColorInspectorOpen, setIsColorInspectorOpen] = useState(false);
   const [currentProjectName, setCurrentProjectName] = useState("New Project");
@@ -44,6 +49,71 @@ export default function App() {
   const [isGlobalDragging, setIsGlobalDragging] = useState(false);
   const globalDragCounter = useRef(0);
 
+  const handleJumpToBlockForFont = (font: UploadedFont) => {
+    if (!font) return;
+    try {
+      const supported = font.supportedCodePoints;
+      if (!supported || (supported instanceof Set && supported.size === 0)) return;
+
+      const blockCounts = new Uint32Array(UNICODE_BLOCKS.length);
+      let sampleCount = 0;
+
+      if (supported instanceof Set) {
+        for (const cp of supported) {
+          if (typeof cp !== 'number' || cp < 0) continue;
+          const bIdx = getBlockIndexForCodepoint(cp);
+          if (typeof bIdx === 'number' && bIdx >= 0 && bIdx < blockCounts.length) {
+            blockCounts[bIdx]++;
+          }
+          sampleCount++;
+          if (sampleCount >= 10000) break;
+        }
+      } else if (Array.isArray(supported as any)) {
+        for (const cp of (supported as any as number[])) {
+          if (typeof cp !== 'number' || cp < 0) continue;
+          const bIdx = getBlockIndexForCodepoint(cp);
+          if (typeof bIdx === 'number' && bIdx >= 0 && bIdx < blockCounts.length) {
+            blockCounts[bIdx]++;
+          }
+          sampleCount++;
+          if (sampleCount >= 10000) break;
+        }
+      }
+      if (sampleCount === 0) return;
+
+      let bestIdx = -1;
+      let maxCount = 0;
+      let fallbackPuaIdx = -1;
+      let maxPuaCount = 0;
+
+      for (let i = 0; i < blockCounts.length; i++) {
+        const bName = UNICODE_BLOCKS[i]?.name || '';
+        const isPUA = bName.includes('Private Use') || bName.includes('PUA');
+        if (isPUA) {
+          if (blockCounts[i] > maxPuaCount) {
+            maxPuaCount = blockCounts[i];
+            fallbackPuaIdx = i;
+          }
+        } else {
+          if (blockCounts[i] > maxCount) {
+            maxCount = blockCounts[i];
+            bestIdx = i;
+          }
+        }
+      }
+
+      if (bestIdx === -1 && fallbackPuaIdx !== -1) {
+        bestIdx = fallbackPuaIdx;
+      }
+
+      if (bestIdx !== -1 && UNICODE_BLOCKS[bestIdx]) {
+        setSelectedBlockIndex(bestIdx);
+      }
+    } catch (e) {
+      console.warn('Block jump notice:', e);
+    }
+  };
+
   const [fontLoadingProgress, setFontLoadingProgress] = useState<FontLoadingProgress | null>(null);
   const [isProcessingFonts, setIsProcessingFonts] = useState(false);
   const [fontLoadError, setFontLoadError] = useState<string | null>(null);
@@ -56,11 +126,11 @@ export default function App() {
     setFontLoadError(null);
     setFontLoadSuccess(null);
     setFontLoadingProgress({
-      current: 0,
+      current: 1,
       total: files.length,
-      percent: 0,
+      percent: 12,
       fileName: files[0]?.name || 'font file',
-      status: `Initializing ${files.length} file${files.length > 1 ? 's' : ''}...`
+      status: `Reading ${files[0]?.name || 'font file'}...`
     });
 
     try {
@@ -74,13 +144,17 @@ export default function App() {
         }
         setFonts(prev => {
           const remaining = prev.filter(p => !result.newFonts.some(nf => nf.id === p.id));
-          return [...result.newFonts, ...remaining];
+          return prev.length === 0 ? [...result.newFonts, ...remaining] : [...remaining, ...result.newFonts];
         });
         setFontLoadSuccess(`Loaded ${result.newFonts.length} font${result.newFonts.length > 1 ? 's' : ''} successfully!`);
         setTimeout(() => setFontLoadSuccess(null), 3500);
 
         if (result.newFonts[0]) {
-          handleJumpToBlockForFont(result.newFonts[0]);
+          setTimeout(() => {
+            try {
+              handleJumpToBlockForFont(result.newFonts[0]);
+            } catch {}
+          }, 50);
         }
       }
 
@@ -92,8 +166,10 @@ export default function App() {
     } catch (err: any) {
       setFontLoadError(`Failed to load font file: ${err?.message || String(err)}`);
     } finally {
-      setIsProcessingFonts(false);
-      setFontLoadingProgress(null);
+      setTimeout(() => {
+        setIsProcessingFonts(false);
+        setFontLoadingProgress(null);
+      }, 300);
     }
   };
 
@@ -120,6 +196,10 @@ export default function App() {
       e.preventDefault();
       globalDragCounter.current = 0;
       setIsGlobalDragging(false);
+      // If the drop occurred inside FontManager, it handles it directly
+      if ((e.target as HTMLElement)?.closest?.('[data-font-manager-drop]')) {
+        return;
+      }
       if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length > 0) {
         handleProcessFontFiles(e.dataTransfer.files);
       }
@@ -145,20 +225,61 @@ export default function App() {
     async function load() {
       setIsRestoringWorkspace(true);
       try {
-        const timeoutPromise = new Promise<null>((resolve) => setTimeout(() => resolve(null), 1200));
-        const saved = await Promise.race([loadWorkspace(), timeoutPromise]);
+        const saved = await loadWorkspace((p) => setRestoreProgress(p));
         if (isCancelled) return;
         if (saved && saved.fonts && saved.fonts.length > 0) {
           saved.fonts.forEach(f => {
-            if (f.buffer) registerFontBuffer(f.id, f.name, f.fileName, f.buffer);
+            if (f.buffer && f.buffer.byteLength > 0) registerFontBuffer(f.id, f.name, f.fileName, f.buffer);
           });
           setFonts(saved.fonts);
           setGlyphMap(saved.glyphMap || {});
+          lastSavedSignatureRef.current = `${saved.fonts.map(f => f.id).join(',')}:${Object.keys(saved.glyphMap || {}).length}`;
+          if (saved.fonts[0]) {
+            const firstFont = saved.fonts[0];
+            setTimeout(() => {
+              try { handleJumpToBlockForFont(firstFont); } catch {}
+            }, 100);
+          }
           historyRef.current = [{ fonts: saved.fonts, glyphMap: saved.glyphMap || {} }];
           historyIndexRef.current = 0;
         } else {
-          historyRef.current = [{ fonts: [], glyphMap: {} }];
-          historyIndexRef.current = 0;
+          // Fallback: check if there is a last active project saved
+          let restoredFromProject = false;
+          if (typeof localStorage !== 'undefined') {
+            const lastProjectId = localStorage.getItem('fontfuser_last_project');
+            if (lastProjectId) {
+              try {
+                const { loadNamedFusion, getFusionsList } = await import('./lib/workspace');
+                const project = await loadNamedFusion(lastProjectId, undefined, undefined, (p) => setRestoreProgress(p));
+                if (project && project.fonts && project.fonts.length > 0 && !isCancelled) {
+                  project.fonts.forEach(f => {
+                    if (f.buffer && f.buffer.byteLength > 0) registerFontBuffer(f.id, f.name, f.fileName, f.buffer);
+                  });
+                  setFonts(project.fonts);
+                  setGlyphMap(project.glyphMap || {});
+                  lastSavedSignatureRef.current = `${project.fonts.map(f => f.id).join(',')}:${Object.keys(project.glyphMap || {}).length}`;
+                  if (project.fonts[0]) {
+                    const firstFont = project.fonts[0];
+                    setTimeout(() => {
+                      try { handleJumpToBlockForFont(firstFont); } catch {}
+                    }, 100);
+                  }
+                  historyRef.current = [{ fonts: project.fonts, glyphMap: project.glyphMap || {} }];
+                  historyIndexRef.current = 0;
+                  restoredFromProject = true;
+                  const fList = await getFusionsList();
+                  const found = fList.find(f => f.id === lastProjectId);
+                  if (found?.name) setCurrentProjectName(found.name);
+                }
+              } catch (e) {
+                console.warn('Fallback last project load skipped:', e);
+              }
+            }
+          }
+          if (!restoredFromProject) {
+            historyRef.current = [{ fonts: [], glyphMap: {} }];
+            historyIndexRef.current = 0;
+          }
         }
         skipHistoryRef.current = true;
         setHistoryLength(historyRef.current.length);
@@ -168,6 +289,7 @@ export default function App() {
       } finally {
         if (!isCancelled) {
           setIsRestoringWorkspace(false);
+          setRestoreProgress(null);
           setIsWorkspaceLoading(false);
         }
       }
@@ -194,9 +316,9 @@ export default function App() {
 
     let newHistory = historyRef.current.slice(0, historyIndexRef.current + 1);
     newHistory.push({ fonts, glyphMap });
-    // Keep max 5 states to prevent memory exhaustion and browser tab crashes
-    if (newHistory.length > 5) {
-      newHistory = newHistory.slice(newHistory.length - 5);
+    // Keep max 3 states to prevent memory exhaustion and browser tab crashes with large fonts
+    if (newHistory.length > 3) {
+      newHistory = newHistory.slice(newHistory.length - 3);
     }
     historyRef.current = newHistory;
     historyIndexRef.current = newHistory.length - 1;
@@ -229,17 +351,24 @@ export default function App() {
   // Save workspace when fonts or glyphMap change
   const saveTimeoutRef = useRef<number | null>(null);
   const isInitialMount = useRef(true);
+  const lastSavedSignatureRef = useRef<string>('');
 
   useEffect(() => {
     if (isWorkspaceLoading) return;
     
     if (isInitialMount.current) {
       isInitialMount.current = false;
+      lastSavedSignatureRef.current = `${fonts.map(f => f.id).join(',')}:${Object.keys(glyphMap).length}`;
       return;
     }
 
     // Guard: never auto-save an empty state over an existing workspace
     if (fonts.length === 0 && Object.keys(glyphMap).length === 0) {
+      return;
+    }
+
+    const currentSignature = `${fonts.map(f => f.id).join(',')}:${Object.keys(glyphMap).length}`;
+    if (currentSignature === lastSavedSignatureRef.current) {
       return;
     }
 
@@ -252,14 +381,16 @@ export default function App() {
     saveTimeoutRef.current = window.setTimeout(async () => {
       try {
         await saveWorkspace(fonts, glyphMap);
+        lastSavedSignatureRef.current = currentSignature;
         setSaveStatus('saved');
         // Reset saved status after 2 seconds
         window.setTimeout(() => setSaveStatus('idle'), 2000);
       } catch (err) {
-        console.error('Failed to auto-save workspace', err);
+        console.warn('Workspace auto-save notice:', err);
         setSaveStatus('error');
+        window.setTimeout(() => setSaveStatus('idle'), 3000);
       }
-    }, 1000); // Debounce saves by 1s
+    }, 1500); // Debounce saves by 1.5s
 
     return () => {
       if (saveTimeoutRef.current) {
@@ -273,11 +404,16 @@ export default function App() {
   const handleGenerate = async () => {
     if (!baseFont) return;
     setIsGenerating(true);
+    setProgressPercent(2);
     setProgressMsg('Initializing generator...');
     try {
-      const arrayBuffer = await generateFusedFont(baseFont, fonts, glyphMap, (msg) => {
+      const arrayBuffer = await generateFusedFont(baseFont, fonts, glyphMap, (msg, pct) => {
         setProgressMsg(msg);
+        if (typeof pct === 'number') {
+          setProgressPercent(pct);
+        }
       });
+      setProgressPercent(100);
       setProgressMsg('Complete! Downloading to your files...');
       
       const baseProjectName = (currentProjectName || 'FusedFont').replace(/\.(otf|ttf|woff|woff2)$/i, '').trim() || 'FusedFont';
@@ -302,44 +438,11 @@ export default function App() {
     } finally {
       setIsGenerating(false);
       setProgressMsg('');
+      setProgressPercent(0);
     }
   };
 
   
-  const handleJumpToBlockForFont = (font: UploadedFont) => {
-    if (!font) return;
-    const supported = font.supportedCodePoints;
-    if (!supported || (supported instanceof Set && supported.size === 0)) return;
-
-    const blockCounts = new Array(UNICODE_BLOCKS.length).fill(0);
-    const cpList = supported instanceof Set ? Array.from(supported) : Array.isArray(supported) ? supported : [];
-    if (cpList.length === 0) return;
-
-    for (const cp of cpList) {
-      if (typeof cp !== 'number' || cp < 0) continue;
-      for (let i = 0; i < UNICODE_BLOCKS.length; i++) {
-        const b = UNICODE_BLOCKS[i];
-        if (b.start >= 0 && cp >= b.start && cp <= b.end) {
-          blockCounts[i]++;
-          break;
-        }
-      }
-    }
-
-    let bestIdx = -1;
-    let maxCount = 0;
-    for (let i = 0; i < blockCounts.length; i++) {
-      if (blockCounts[i] > maxCount) {
-        maxCount = blockCounts[i];
-        bestIdx = i;
-      }
-    }
-
-    if (bestIdx !== -1 && maxCount > 0) {
-      setSelectedBlockIndex(bestIdx);
-    }
-  };
-
   const handleSetBaseFont = (fontId: string) => {
     setFonts(prev => {
       const idx = prev.findIndex(f => f.id === fontId);
@@ -439,6 +542,40 @@ export default function App() {
               </span>
               <span className="text-blue-400/90 animate-pulse font-medium">
                 {fontLoadingProgress.status || "Processing font file..."}
+              </span>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Floating Workspace Font Restoration Progress Bar */}
+      {isRestoringWorkspace && restoreProgress && (
+        <div className="fixed top-16 left-1/2 -translate-x-1/2 z-50 w-full max-w-md px-4 pointer-events-none animate-in fade-in slide-in-from-top-2">
+          <div className="bg-[#0b172a]/95 backdrop-blur-md border border-cyan-500/50 rounded-xl p-4 shadow-2xl flex flex-col gap-2.5 pointer-events-auto">
+            <div className="flex items-center justify-between text-xs font-mono text-cyan-300">
+              <span className="flex items-center gap-2 font-bold text-white">
+                <Loader2 className="w-4 h-4 animate-spin text-cyan-400 shrink-0" />
+                Restoring Saved Fonts ({restoreProgress.current}/{restoreProgress.total})
+              </span>
+              <span className="font-extrabold text-cyan-400 bg-cyan-500/10 px-2 py-0.5 rounded border border-cyan-500/30">
+                {restoreProgress.percent}%
+              </span>
+            </div>
+
+            {/* Progress Bar Track */}
+            <div className="w-full bg-[#070e1a] rounded-full h-3 overflow-hidden border border-cyan-500/30 p-[1.5px]">
+              <div 
+                className="h-full bg-gradient-to-r from-cyan-500 via-blue-500 to-indigo-400 rounded-full transition-all duration-300 ease-out shadow-[0_0_12px_rgba(6,182,212,0.7)]"
+                style={{ width: `${Math.max(8, restoreProgress.percent)}%` }}
+              />
+            </div>
+
+            <div className="flex items-center justify-between text-[11px] text-gray-300 font-mono">
+              <span className="truncate max-w-[220px]" title={restoreProgress.fileName}>
+                {restoreProgress.fileName}
+              </span>
+              <span className="text-cyan-400/90 animate-pulse font-medium">
+                {restoreProgress.status || "Restoring saved font..."}
               </span>
             </div>
           </div>
@@ -561,6 +698,39 @@ export default function App() {
             <span className="hidden sm:inline">Saves</span>
           </button>
           <button
+            onClick={async () => {
+              if (fonts.length === 0) {
+                setGlobalError("Add fonts to your workspace before exporting a .fuser file.");
+                return;
+              }
+              try {
+                const { exportFusionWorkspace } = await import('./lib/exportUtils');
+                await exportFusionWorkspace(currentProjectName, fonts, glyphMap);
+                setResetFeedback(`Exported "${currentProjectName}.fuser" successfully!`);
+                setTimeout(() => setResetFeedback(null), 3500);
+              } catch (err: any) {
+                setGlobalError("Failed to export .fuser: " + (err.message || String(err)));
+              }
+            }}
+            disabled={fonts.length === 0}
+            className="px-3.5 py-2 bg-[#1a1a1a] hover:bg-emerald-950/40 border border-white/10 hover:border-emerald-500/40 text-gray-300 hover:text-emerald-300 text-xs font-bold rounded-sm uppercase tracking-tighter transition-all flex items-center gap-1.5 disabled:opacity-40"
+            title="Download complete .fuser save file containing all fonts and glyph mappings"
+          >
+            <FileDown className="w-3.5 h-3.5 text-emerald-400" />
+            <span className="hidden sm:inline">Export .fuser</span>
+          </button>
+          <button
+            onClick={() => {
+              setSaveToTtfTargetProject(null);
+              setIsSaveToTtfOpen(true);
+            }}
+            className="px-3.5 py-2 bg-gradient-to-r from-emerald-950/70 to-teal-950/70 hover:from-emerald-900/80 hover:to-teal-900/80 border border-emerald-500/40 hover:border-emerald-400 text-emerald-300 text-xs font-bold rounded-sm uppercase tracking-tighter transition-all flex items-center gap-1.5 shadow-sm hover:scale-[1.02] active:scale-[0.98]"
+            title="Save File to TTF Converter: fast direct conversion of .fuser or saved projects to TTF"
+          >
+            <Zap className="w-3.5 h-3.5 text-emerald-400 fill-current" />
+            <span className="hidden sm:inline">Save → TTF</span>
+          </button>
+          <button
             onClick={handleResetWorkspaceCache}
             className="px-3.5 py-2 bg-[#1a1a1a] hover:bg-red-950/50 border border-white/10 hover:border-red-500/40 text-gray-300 hover:text-red-300 text-xs font-bold rounded-sm uppercase tracking-tighter transition-colors flex items-center gap-2"
             title="Reset workspace cache: removes cached font files and stored mappings"
@@ -571,10 +741,13 @@ export default function App() {
           <button
             onClick={handleGenerate}
             disabled={fonts.length === 0 || isGenerating}
-            className="px-4 py-2 bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white text-xs font-bold rounded-sm uppercase tracking-tighter transition-colors flex items-center gap-2"
+            className="px-4 py-2 bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white text-xs font-bold rounded-sm uppercase tracking-tighter transition-colors flex items-center gap-2 shrink-0 min-w-[170px] justify-center"
           >
             {isGenerating ? (
-              <span className="animate-pulse">{progressMsg || 'Generating...'}</span>
+              <>
+                <Loader2 className="w-4 h-4 animate-spin text-white" />
+                <span>{Math.round(progressPercent)}% Fusing...</span>
+              </>
             ) : (
               <>
                 <Download className="w-4 h-4" />
@@ -595,6 +768,10 @@ export default function App() {
             hasSelection={selectedCharacters.size > 0}
             setGlyphMap={setGlyphMap}
             onJumpToBlockForFont={handleJumpToBlockForFont}
+            isRestoringWorkspace={isRestoringWorkspace}
+            restoreProgress={restoreProgress}
+            externalLoadingProgress={fontLoadingProgress}
+            isExternalProcessing={isProcessingFonts}
           />
         </ErrorBoundary>
         
@@ -619,10 +796,20 @@ export default function App() {
             Engine Ready
           </span>
           {isRestoringWorkspace && (
-            <span className="flex items-center gap-1.5 text-blue-400">
-              <Loader2 className="w-3 h-3 animate-spin text-blue-400" />
-              Restoring saved fonts...
-            </span>
+            <div className="flex items-center gap-2 text-cyan-400">
+              <Loader2 className="w-3 h-3 animate-spin text-cyan-400 shrink-0" />
+              <span>
+                Restoring fonts {restoreProgress ? `(${restoreProgress.current}/${restoreProgress.total} • ${restoreProgress.percent}%)` : '...'}
+              </span>
+              {restoreProgress && (
+                <div className="w-20 bg-cyan-950/80 rounded-full h-1.5 overflow-hidden border border-cyan-500/30 hidden sm:block">
+                  <div 
+                    className="h-full bg-cyan-400 rounded-full transition-all duration-300 shadow-[0_0_8px_rgba(6,182,212,0.8)]"
+                    style={{ width: `${Math.max(8, restoreProgress.percent)}%` }}
+                  />
+                </div>
+              )}
+            </div>
           )}
         </div>
         <div className="flex items-center gap-4">
@@ -648,13 +835,22 @@ export default function App() {
           await saveNamedFusion(name, fonts, glyphMap);
         }}
         onLoad={(loadedFonts, loadedGlyphMap, loadedName) => {
+          if (!loadedFonts || loadedFonts.length === 0) {
+            console.warn('Prevented workspace wipeout: loaded fonts was empty');
+            return;
+          }
           loadedFonts.forEach(f => {
-            if (f.buffer) registerFontBuffer(f.id, f.name, f.fileName, f.buffer);
+            if (f.buffer && f.buffer.byteLength > 0) {
+              registerFontBuffer(f.id, f.name, f.fileName, f.buffer);
+            }
           });
           setFonts(loadedFonts);
           setGlyphMap(loadedGlyphMap);
           setSelectedCharacters(new Set());
           if (loadedName) setCurrentProjectName(loadedName);
+          if (loadedFonts[0]) {
+            handleJumpToBlockForFont(loadedFonts[0]);
+          }
           historyRef.current = [{ fonts: loadedFonts, glyphMap: loadedGlyphMap }];
           historyIndexRef.current = 0;
           skipHistoryRef.current = true;
@@ -662,6 +858,20 @@ export default function App() {
           setCurrentHistoryIndex(0);
           saveWorkspace(loadedFonts, loadedGlyphMap).catch(() => {});
         }}
+        onOpenSaveToTtfConverter={(projectId, projectName) => {
+          setSaveToTtfTargetProject(projectId ? { id: projectId, name: projectName } : null);
+          setIsSaveToTtfOpen(true);
+        }}
+      />
+
+      <SaveToTtfModal
+        isOpen={isSaveToTtfOpen}
+        onClose={() => {
+          setIsSaveToTtfOpen(false);
+          setSaveToTtfTargetProject(null);
+        }}
+        initialProjectId={saveToTtfTargetProject?.id}
+        initialProjectName={saveToTtfTargetProject?.name}
       />
 
       <TypeTesterModal
@@ -709,6 +919,51 @@ export default function App() {
             >
               <X className="w-4 h-4" />
             </button>
+          </div>
+        </div>
+      )}
+
+      {isGenerating && (
+        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-md flex items-center justify-center p-4 animate-in fade-in duration-200">
+          <div className="bg-[#181818] border border-blue-500/30 rounded-xl p-6 max-w-lg w-full shadow-2xl space-y-5">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-lg bg-blue-500/20 text-blue-400 flex items-center justify-center font-bold">
+                  <Loader2 className="w-5 h-5 animate-spin text-blue-400" />
+                </div>
+                <div>
+                  <h3 className="text-sm font-bold text-white uppercase tracking-wider">Compiling Fused Font</h3>
+                  <p className="text-xs text-gray-400 font-mono truncate max-w-[260px]">
+                    {(currentProjectName || 'FusedFont').replace(/\.(otf|ttf|woff|woff2)$/i, '')}.otf
+                  </p>
+                </div>
+              </div>
+              <div className="text-right">
+                <span className="text-2xl font-black font-mono text-blue-400">
+                  {Math.min(100, Math.max(0, Math.round(progressPercent)))}%
+                </span>
+              </div>
+            </div>
+
+            {/* Progress Bar */}
+            <div className="space-y-2">
+              <div className="w-full bg-[#101010] rounded-full h-3.5 overflow-hidden p-0.5 border border-white/10 shadow-inner">
+                <div
+                  className="bg-gradient-to-r from-blue-600 via-indigo-500 to-cyan-400 h-full rounded-full transition-all duration-300 ease-out shadow-[0_0_12px_rgba(59,130,246,0.5)]"
+                  style={{ width: `${Math.max(4, Math.min(100, progressPercent))}%` }}
+                />
+              </div>
+              <div className="flex items-center justify-between text-[11px] text-gray-400 font-mono">
+                <span className="truncate pr-2 text-gray-200 font-medium">
+                  {progressMsg || 'Processing vector outlines...'}
+                </span>
+                <span className="shrink-0 text-gray-500">Fast CFF engine</span>
+              </div>
+            </div>
+
+            <div className="p-3 bg-white/[0.03] rounded-lg border border-white/5 text-[11px] text-gray-400 leading-relaxed">
+              Generating OpenType Type 2 CFF CharStrings and merging color tables (COLR, CPAL, SVG). Please keep this tab active while compilation completes.
+            </div>
           </div>
         </div>
       )}

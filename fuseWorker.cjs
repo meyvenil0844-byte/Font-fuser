@@ -90,6 +90,131 @@ function installDataViewSafetyPolyfill() {
 }
 installDataViewSafetyPolyfill();
 
+function extractSubfontFromTtc(arrayBuffer, preferredSubfontName) {
+  if (!arrayBuffer || arrayBuffer.byteLength < 16) return arrayBuffer;
+  const view = new DataView(arrayBuffer);
+  if (view.getUint32(0, false) !== 0x74746366) return arrayBuffer;
+
+  const numFonts = view.getUint32(8, false);
+  if (numFonts <= 0) return arrayBuffer;
+
+  const fontOffsets = [];
+  for (let i = 0; i < numFonts; i++) {
+    const off = view.getUint32(12 + i * 4, false);
+    if (off + 12 <= arrayBuffer.byteLength) fontOffsets.push(off);
+  }
+  if (fontOffsets.length === 0) return arrayBuffer;
+
+  const getSubfontName = (sfntOff) => {
+    try {
+      const numTables = view.getUint16(sfntOff + 4, false);
+      let nameTableOff = 0;
+      for (let t = 0; t < numTables; t++) {
+        const rec = sfntOff + 12 + t * 16;
+        if (rec + 16 > arrayBuffer.byteLength) break;
+        const tag = String.fromCharCode(view.getUint8(rec), view.getUint8(rec + 1), view.getUint8(rec + 2), view.getUint8(rec + 3));
+        if (tag === 'name') {
+          nameTableOff = view.getUint32(rec + 8, false);
+          break;
+        }
+      }
+      if (nameTableOff > 0 && nameTableOff + 6 <= arrayBuffer.byteLength) {
+        const count = view.getUint16(nameTableOff + 2, false);
+        const stringOffset = nameTableOff + view.getUint16(nameTableOff + 4, false);
+        let bestName = '';
+        for (let k = 0; k < count; k++) {
+          const nr = nameTableOff + 6 + k * 12;
+          if (nr + 12 > arrayBuffer.byteLength) break;
+          const nameId = view.getUint16(nr + 6, false);
+          if (nameId === 1 || nameId === 4) {
+            const len = view.getUint16(nr + 8, false);
+            const strOff = stringOffset + view.getUint16(nr + 10, false);
+            if (strOff + len <= arrayBuffer.byteLength && len > 0) {
+              const b = new Uint8Array(arrayBuffer, strOff, len);
+              let s = '';
+              if (b.length >= 2 && b[0] === 0) {
+                for (let j = 1; j < b.length; j += 2) s += String.fromCharCode(b[j]);
+              } else {
+                try { s = Buffer.from(b).toString('utf8'); } catch { s = ''; }
+              }
+              s = s.trim();
+              if (s) {
+                if (nameId === 4) return s;
+                if (!bestName) bestName = s;
+              }
+            }
+          }
+        }
+        return bestName;
+      }
+    } catch {}
+    return '';
+  };
+
+  let selectedIndex = 0;
+  if (preferredSubfontName && fontOffsets.length > 1) {
+    const norm = (s) => (s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+    const targetNorm = norm(preferredSubfontName);
+    let bestScore = -1;
+    for (let i = 0; i < fontOffsets.length; i++) {
+      const name = getSubfontName(fontOffsets[i]);
+      const subNorm = norm(name);
+      let score = 0;
+      if (subNorm === targetNorm) score = 100;
+      else if (subNorm && targetNorm && subNorm.includes(targetNorm)) score = 80;
+      else if (subNorm && targetNorm && targetNorm.includes(subNorm)) score = 70;
+      else if (targetNorm.includes('tc') && (subNorm.includes('tc') || subNorm.includes('traditional'))) score = 90;
+      else if (targetNorm.includes('sc') && (subNorm.includes('sc') || subNorm.includes('simplified'))) score = 90;
+      else if (targetNorm.includes('hk') && subNorm.includes('hk')) score = 90;
+      if (score > bestScore) {
+        bestScore = score;
+        selectedIndex = i;
+      }
+    }
+  }
+
+  const sfntOffset = fontOffsets[selectedIndex];
+  if (sfntOffset + 12 > arrayBuffer.byteLength) return arrayBuffer;
+  const numTables = view.getUint16(sfntOffset + 4, false);
+  const headerLen = 12 + numTables * 16;
+  if (sfntOffset + headerLen > arrayBuffer.byteLength) return arrayBuffer;
+
+  const tables = [];
+  let totalDataLength = 0;
+  for (let t = 0; t < numTables; t++) {
+    const rec = sfntOffset + 12 + t * 16;
+    const tagBytes = new Uint8Array(arrayBuffer, rec, 4);
+    const checkSum = view.getUint32(rec + 4, false);
+    const origOffset = view.getUint32(rec + 8, false);
+    const length = view.getUint32(rec + 12, false);
+    if (origOffset + length > arrayBuffer.byteLength) continue;
+    tables.push({ tag: tagBytes, checkSum, origOffset, length });
+    totalDataLength += ((length + 3) & ~3);
+  }
+
+  const outSize = 12 + tables.length * 16 + totalDataLength;
+  const outBuf = new ArrayBuffer(outSize);
+  const outBytes = new Uint8Array(outBuf);
+  const outView = new DataView(outBuf);
+
+  outBytes.set(new Uint8Array(arrayBuffer, sfntOffset, 12), 0);
+  outView.setUint16(4, tables.length, false);
+
+  let currentDataOffset = 12 + tables.length * 16;
+  for (let t = 0; t < tables.length; t++) {
+    const tbl = tables[t];
+    const recOffset = 12 + t * 16;
+    outBytes.set(tbl.tag, recOffset);
+    outView.setUint32(recOffset + 4, tbl.checkSum, false);
+    outView.setUint32(recOffset + 8, currentDataOffset, false);
+    outView.setUint32(recOffset + 12, tbl.length, false);
+    outBytes.set(new Uint8Array(arrayBuffer, tbl.origOffset, tbl.length), currentDataOffset);
+    currentDataOffset += ((tbl.length + 3) & ~3);
+  }
+
+  return outBuf;
+}
+
 process.on('uncaughtException', (err) => {
   console.error('[Worker uncaughtException]', err);
   if (process.send) {
@@ -410,18 +535,202 @@ const NEGATED_MATH_MAP = {
   0x2271: 0x2265, // ≱ -> ≥
 };
 
+const SHARED_CFF_BUF = Buffer.allocUnsafe(131072);
+
+function writeCffNumber(buf, pos, v) {
+  v = Math.round(v);
+  if (v >= -107 && v <= 107) {
+    buf[pos++] = (v + 139) & 255;
+  } else if (v >= 108 && v <= 1131) {
+    v = v - 108;
+    buf[pos++] = ((v >> 8) + 247) & 255;
+    buf[pos++] = v & 255;
+  } else if (v >= -1131 && v <= -108) {
+    v = -v - 108;
+    buf[pos++] = ((v >> 8) + 251) & 255;
+    buf[pos++] = v & 255;
+  } else if (v >= -32768 && v <= 32767) {
+    buf[pos++] = 28;
+    buf[pos++] = (v >> 8) & 255;
+    buf[pos++] = v & 255;
+  } else {
+    buf[pos++] = 29;
+    buf[pos++] = (v >> 24) & 255;
+    buf[pos++] = (v >> 16) & 255;
+    buf[pos++] = (v >> 8) & 255;
+    buf[pos++] = v & 255;
+  }
+  return pos;
+}
+
+function fastEncodeCharStringAndMetrics(glyph) {
+  if (glyph._rawCharString && glyph._cachedMetrics) {
+    return { rawCharString: glyph._rawCharString, metrics: glyph._cachedMetrics };
+  }
+
+  const advW = typeof glyph.advanceWidth === 'number' && isFinite(glyph.advanceWidth) ? Math.round(glyph.advanceWidth) : 500;
+  let path = null;
+  try {
+    if (typeof glyph.path === 'function') path = glyph.path();
+    else if (glyph.path) path = glyph.path;
+    else if (typeof glyph.getPath === 'function') path = glyph.getPath();
+  } catch (e) {}
+
+  const commands = path && Array.isArray(path.commands) ? path.commands : [];
+  if (commands.length === 0) {
+    let pos = 0;
+    pos = writeCffNumber(SHARED_CFF_BUF, pos, advW);
+    SHARED_CFF_BUF[pos++] = 14; // endchar
+    const rawCharString = Buffer.from(SHARED_CFF_BUF.subarray(0, pos));
+    const lsb = glyph.leftSideBearing !== undefined ? glyph.leftSideBearing : 0;
+    const metrics = { xMin: 0, yMin: 0, xMax: 0, yMax: 0, leftSideBearing: lsb, rightSideBearing: advW };
+    glyph._rawCharString = rawCharString;
+    glyph._cachedMetrics = metrics;
+    return { rawCharString, metrics };
+  }
+
+  let buf = SHARED_CFF_BUF;
+  const maxNeeded = commands.length * 36 + 32;
+  if (maxNeeded > buf.length) {
+    buf = Buffer.allocUnsafe(maxNeeded);
+  }
+
+  let pos = 0;
+  pos = writeCffNumber(buf, pos, advW);
+
+  let x = 0;
+  let y = 0;
+  let xMin = Infinity, yMin = Infinity, xMax = -Infinity, yMax = -Infinity;
+  const num = (v) => (typeof v === 'number' && isFinite(v)) ? v : 0;
+
+  for (let i = 0; i < commands.length; i++) {
+    const cmd = commands[i];
+    if (!cmd) continue;
+
+    if (cmd.type === 'M') {
+      const cx = Math.round(num(cmd.x));
+      const cy = Math.round(num(cmd.y));
+      if (cx < xMin) xMin = cx; if (cx > xMax) xMax = cx;
+      if (cy < yMin) yMin = cy; if (cy > yMax) yMax = cy;
+
+      pos = writeCffNumber(buf, pos, cx - x);
+      pos = writeCffNumber(buf, pos, cy - y);
+      buf[pos++] = 21; // rmoveto
+      x = cx;
+      y = cy;
+    } else if (cmd.type === 'L') {
+      const cx = Math.round(num(cmd.x));
+      const cy = Math.round(num(cmd.y));
+      if (cx < xMin) xMin = cx; if (cx > xMax) xMax = cx;
+      if (cy < yMin) yMin = cy; if (cy > yMax) yMax = cy;
+
+      pos = writeCffNumber(buf, pos, cx - x);
+      pos = writeCffNumber(buf, pos, cy - y);
+      buf[pos++] = 5; // rlineto
+      x = cx;
+      y = cy;
+    } else if (cmd.type === 'C') {
+      const cx1 = Math.round(cmd.x1);
+      const cy1 = Math.round(cmd.y1);
+      const cx2 = Math.round(cmd.x2);
+      const cy2 = Math.round(cmd.y2);
+      const cx = Math.round(cmd.x);
+      const cy = Math.round(cmd.y);
+
+      if (cx1 < xMin) xMin = cx1; if (cx1 > xMax) xMax = cx1;
+      if (cy1 < yMin) yMin = cy1; if (cy1 > yMax) yMax = cy1;
+      if (cx2 < xMin) xMin = cx2; if (cx2 > xMax) xMax = cx2;
+      if (cy2 < yMin) yMin = cy2; if (cy2 > yMax) yMax = cy2;
+      if (cx < xMin) xMin = cx; if (cx > xMax) xMax = cx;
+      if (cy < yMin) yMin = cy; if (cy > yMax) yMax = cy;
+
+      pos = writeCffNumber(buf, pos, cx1 - x);
+      pos = writeCffNumber(buf, pos, cy1 - y);
+      pos = writeCffNumber(buf, pos, cx2 - cx1);
+      pos = writeCffNumber(buf, pos, cy2 - cy1);
+      pos = writeCffNumber(buf, pos, cx - cx2);
+      pos = writeCffNumber(buf, pos, cy - cy2);
+      buf[pos++] = 8; // rrcurveto
+      x = cx;
+      y = cy;
+    } else if (cmd.type === 'Q') {
+      const qx1 = cmd.x1;
+      const qy1 = cmd.y1;
+      const qx = cmd.x;
+      const qy = cmd.y;
+
+      const cx1 = Math.round(x + (2 / 3) * (qx1 - x));
+      const cy1 = Math.round(y + (2 / 3) * (qy1 - y));
+      const cx2 = Math.round(qx + (2 / 3) * (qx1 - qx));
+      const cy2 = Math.round(qy + (2 / 3) * (qy1 - qy));
+      const cx = Math.round(qx);
+      const cy = Math.round(qy);
+
+      if (cx1 < xMin) xMin = cx1; if (cx1 > xMax) xMax = cx1;
+      if (cy1 < yMin) yMin = cy1; if (cy1 > yMax) yMax = cy1;
+      if (cx2 < xMin) xMin = cx2; if (cx2 > xMax) xMax = cx2;
+      if (cy2 < yMin) yMin = cy2; if (cy2 > yMax) yMax = cy2;
+      if (cx < xMin) xMin = cx; if (cx > xMax) xMax = cx;
+      if (cy < yMin) yMin = cy; if (cy > yMax) yMax = cy;
+
+      pos = writeCffNumber(buf, pos, cx1 - x);
+      pos = writeCffNumber(buf, pos, cy1 - y);
+      pos = writeCffNumber(buf, pos, cx2 - cx1);
+      pos = writeCffNumber(buf, pos, cy2 - cy1);
+      pos = writeCffNumber(buf, pos, cx - cx2);
+      pos = writeCffNumber(buf, pos, cy - cy2);
+      buf[pos++] = 8; // rrcurveto
+      x = cx;
+      y = cy;
+    }
+  }
+
+  buf[pos++] = 14; // endchar
+
+  if (!isFinite(xMin)) { xMin = 0; xMax = 0; yMin = 0; yMax = 0; }
+  const lsb = glyph.leftSideBearing !== undefined ? glyph.leftSideBearing : xMin;
+  const metrics = {
+    xMin,
+    yMin,
+    xMax,
+    yMax,
+    leftSideBearing: lsb,
+    rightSideBearing: advW - xMax
+  };
+
+  const rawCharString = Buffer.from(buf.subarray(0, pos));
+  glyph._rawCharString = rawCharString;
+  glyph._cachedMetrics = metrics;
+  return { rawCharString, metrics };
+}
+
 process.on('message', (workerData) => {
 try {
   let { glyphMap, baseFontId, serverFontIds, uploadDir } = workerData;
+  const os = require('os');
+  const defaultUploadDir = path.join(os.tmpdir ? os.tmpdir() : '/tmp', 'fontfuser-uploads');
+  uploadDir = uploadDir || defaultUploadDir;
+  if (!fs.existsSync(uploadDir)) {
+    try { fs.mkdirSync(uploadDir, { recursive: true }); } catch (e) {}
+  }
+
+  process.send({ type: 'progress', percent: 10, message: 'Parsing base font and glyph mappings...' });
   
   let baseFontParsed = null;
+  const baseServerFilename = serverFontIds[baseFontId];
+  if (!baseServerFilename) throw new Error("Base font missing");
+  let baseFilePath = path.join(uploadDir, baseServerFilename);
+  if (!fs.existsSync(baseFilePath)) {
+    const pPath = path.join(process.cwd(), 'user_fonts', baseServerFilename);
+    if (fs.existsSync(pPath)) baseFilePath = pPath;
+  }
+  if (!fs.existsSync(baseFilePath)) throw new Error("Base font file missing");
   {
-    const serverFilename = serverFontIds[baseFontId];
-    if (!serverFilename) throw new Error("Base font missing");
-    const filePath = path.join(uploadDir, serverFilename);
-    if (!fs.existsSync(filePath)) throw new Error("Base font file missing");
-    let buffer = fs.readFileSync(filePath);
+    let buffer = fs.readFileSync(baseFilePath);
     let ab = buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
+    if (ab.byteLength >= 4 && new DataView(ab).getUint32(0, false) === 0x74746366) {
+      ab = extractSubfontFromTtc(ab, baseServerFilename);
+    }
     baseFontParsed = opentype.parse(ab);
     buffer = null;
     ab = null;
@@ -433,15 +742,30 @@ try {
   const MAX_CACHE = 1;
   
   function getTargetFont(clientId) {
+    if (clientId === baseFontId && baseFontParsed) return baseFontParsed;
     if (parsedFontsCache.has(clientId)) return parsedFontsCache.get(clientId);
-    const serverFilename = serverFontIds[clientId];
+    let serverFilename = serverFontIds[clientId];
+    if (!serverFilename && typeof clientId === 'string') {
+      if (clientId.endsWith('.ttf') || clientId.endsWith('.otf') || clientId.endsWith('.ttc')) {
+        serverFilename = clientId;
+      }
+    }
     if (!serverFilename) return null;
-    const filePath = path.join(uploadDir, serverFilename);
+    let filePath = path.join(uploadDir, serverFilename);
+    if (!fs.existsSync(filePath)) {
+      const pPath = path.join(process.cwd(), 'user_fonts', serverFilename);
+      if (fs.existsSync(pPath)) filePath = pPath;
+    }
     if (!fs.existsSync(filePath)) return null;
     
     try {
       let buffer = fs.readFileSync(filePath);
       let ab = buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
+      if (ab.byteLength >= 4 && new DataView(ab).getUint32(0, false) === 0x74746366) {
+        try {
+          ab = extractSubfontFromTtc(ab, serverFilename);
+        } catch (te) {}
+      }
       const font = opentype.parse(ab);
       buffer = null;
       ab = null;
@@ -449,6 +773,7 @@ try {
       if (parsedFontsCache.size >= MAX_CACHE) {
         const firstKey = parsedFontsCache.keys().next().value;
         parsedFontsCache.delete(firstKey);
+        if (typeof global.gc === 'function') global.gc();
       }
       parsedFontsCache.set(clientId, font);
       return font;
@@ -489,6 +814,30 @@ try {
     }
   }
 
+  function createFastGlyphIndexLookup(font) {
+    if (!font) return () => 0;
+    const cmapMap = (font.tables && font.tables.cmap && font.tables.cmap.glyphIndexMap) ||
+                    (font.encoding && font.encoding.cmap && font.encoding.cmap.glyphIndexMap);
+    if (cmapMap) {
+      return (cp) => {
+        const idx = cmapMap[cp];
+        return (typeof idx === 'number' && idx >= 0) ? idx : 0;
+      };
+    }
+    const cache = new Map();
+    return (cp) => {
+      if (cache.has(cp)) return cache.get(cp);
+      let idx = 0;
+      try {
+        idx = font.charToGlyphIndex(String.fromCodePoint(cp)) || 0;
+      } catch (e) {}
+      cache.set(cp, idx);
+      return idx;
+    };
+  }
+
+  const baseGlyphLookup = createFastGlyphIndexLookup(baseFontParsed);
+
   const mappedCodepoints = new Set(Object.keys(glyphMap).map(Number));
   let missingCount = 0;
   let hitLimit = false;
@@ -503,189 +852,197 @@ try {
   }
   
   for (const targetFontId of Object.keys(fontToCps)) {
-      const cps = fontToCps[targetFontId];
+    const cps = fontToCps[targetFontId];
+    if (!cps || cps.length === 0) continue;
       
     const memBefore = process.memoryUsage();
-    process.send({ type: 'progress', message: `Loading target font ${targetFontId} (Mem: ${Math.round(memBefore.heapUsed/1024/1024)}MB)` });
+    const loadPct = Math.min(68, 15 + Math.round((processed / Math.max(1, mappedCodepoints.size)) * 50));
+    process.send({ type: 'progress', percent: loadPct, message: `Loading font ${targetFontId} (Mem: ${Math.round(memBefore.heapUsed/1024/1024)}MB)` });
     const targetFont = getTargetFont(targetFontId);
 
-      if (!targetFont) continue;
+    if (!targetFont) {
+      processed += cps.length;
+      missingCount += cps.length;
+      continue;
+    }
+    
+    const targetGlyphLookup = createFastGlyphIndexLookup(targetFont);
       
-      for (const cp of cps) {
+    for (const cp of cps) {
+      try {
+        let sourceGlyphIndex = targetGlyphLookup(cp);
+        if (!sourceGlyphIndex || sourceGlyphIndex <= 0) { 
+          const isTraced = (targetFont.names && (
+            (targetFont.names.fontFamily && (targetFont.names.fontFamily.en === 'TracedFont' || targetFont.names.fontFamily === 'TracedFont')) ||
+            (targetFont.names.windows && targetFont.names.windows.fontFamily && targetFont.names.windows.fontFamily.en === 'TracedFont') ||
+            (targetFont.names.macintosh && targetFont.names.macintosh.fontFamily && targetFont.names.macintosh.fontFamily.en === 'TracedFont')
+          ));
+          if (isTraced || (targetFont.glyphs && targetFont.glyphs.length === 2)) {
+            sourceGlyphIndex = targetGlyphLookup(65); // 'A'
+            if (!sourceGlyphIndex || sourceGlyphIndex <= 0) {
+              sourceGlyphIndex = 1;
+            }
+          }
+        }
+        
+        let isSourceValid = false;
+        if (sourceGlyphIndex > 0) {
+          isSourceValid = true;
+        } else if (sourceGlyphIndex === 0 && (cp === 0xFFFD || cp === 0)) {
+          isSourceValid = true;
+        } else if (cp >= 0x1BC00 && cp <= 0x1BCA3) {
+          const fallbackFont = getDuployanFallbackFont();
+          if (fallbackFont) {
+            try {
+              const fg = fallbackFont.charToGlyph(String.fromCodePoint(cp));
+              if (fg) {
+                let fgCommands = null;
+                if (typeof fg.path === 'function') fgCommands = fg.path()?.commands;
+                else if (fg.path) fgCommands = fg.path.commands;
+                else if (typeof fg.getPath === 'function') fgCommands = fg.getPath()?.commands;
+                if (fgCommands && fgCommands.length > 0) isSourceValid = true;
+              }
+            } catch (e) {}
+          }
+        }
+        
+        if (!isSourceValid) {
+          missingCount++;
+          processed++;
+          continue; 
+        }
+        
+        let baseGlyphIndex = 0;
         try {
-          let sourceGlyphIndex = targetFont.charToGlyphIndex(String.fromCodePoint(cp));
-          if (!sourceGlyphIndex || sourceGlyphIndex <= 0) { 
-             if (targetFont.names && targetFont.names.fontFamily && targetFont.names.fontFamily.en === 'TracedFont') {
-              sourceGlyphIndex = targetFont.charToGlyphIndex('A');
+          baseGlyphIndex = baseGlyphLookup(cp);
+        } catch (e) {}
+        if (cp === 0xFFFD && (!baseGlyphIndex || baseGlyphIndex <= 0)) {
+          baseGlyphIndex = 0; 
+        }
+
+        let sourceGlyph = null;
+        try {
+          sourceGlyph = (sourceGlyphIndex > 0 || sourceGlyphIndex === 0) ? targetFont.glyphs.get(sourceGlyphIndex) : null;
+        } catch (e) {
+          sourceGlyph = null;
+        }
+        const scale = targetUnitsPerEm / (targetFont.unitsPerEm || 1000);
+        
+        let newGlyph = null;
+        if (!targetFont.precompiledCache) targetFont.precompiledCache = new Map();
+        if (sourceGlyphIndex > 0 && targetFont.precompiledCache.has(sourceGlyphIndex)) {
+          const cached = targetFont.precompiledCache.get(sourceGlyphIndex);
+          newGlyph = new opentype.Glyph({
+            name: cp === 0 ? '.null' : (sourceGlyph?.name || `uni${cp.toString(16).toUpperCase()}`),
+            unicode: cp,
+            advanceWidth: cached.advanceWidth,
+            path: new opentype.Path()
+          });
+          newGlyph._cachedMetrics = cached.metrics;
+          newGlyph._rawCharString = cached.rawCharString;
+        } else {
+          let scaledPath = new opentype.Path();
+          if (sourceGlyph) {
+            try {
+              let p = null;
+              if (typeof sourceGlyph.path === 'function') {
+                p = sourceGlyph.path();
+              } else if (sourceGlyph.path) {
+                p = sourceGlyph.path;
+              } else if (typeof sourceGlyph.getPath === 'function') {
+                p = sourceGlyph.getPath();
+              }
+              scaledPath = scalePath(p, scale, isCFF);
+            } catch (e) {
+              scaledPath = new opentype.Path();
             }
           }
-          
-          let isSourceValid = false;
-          if (sourceGlyphIndex > 0) {
-              isSourceValid = true;
-          } else if (sourceGlyphIndex === 0 && (cp === 0xFFFD || cp === 0)) {
-              isSourceValid = true;
-          } else if (cp >= 0x1BC00 && cp <= 0x1BCA3) {
-              const fallbackFont = getDuployanFallbackFont();
-              if (fallbackFont) {
-                try {
-                  const fg = fallbackFont.charToGlyph(String.fromCodePoint(cp));
-                  if (fg) {
-                    let fgCommands = null;
-                    if (typeof fg.getPath === 'function') fgCommands = fg.getPath()?.commands;
-                    else if (fg.path) fgCommands = typeof fg.path === 'function' ? fg.path()?.commands : fg.path.commands;
-                    if (fgCommands && fgCommands.length > 0) isSourceValid = true;
-                  }
-                } catch (e) {}
-              }
-          }
-          
-          if (!isSourceValid) {
-              missingCount++; continue; 
-          }
-          
-          let baseGlyphIndex = 0;
+          let advanceW = 0;
           try {
-            baseGlyphIndex = baseFontParsed.charToGlyphIndex(String.fromCodePoint(cp));
+            advanceW = sourceGlyph ? Math.round((sourceGlyph.advanceWidth || 0) * scale) : 0;
           } catch (e) {}
-          if (cp === 0xFFFD && (!baseGlyphIndex || baseGlyphIndex <= 0)) {
-              baseGlyphIndex = 0; 
-          }
 
-          let sourceGlyph = null;
-          try {
-            sourceGlyph = (sourceGlyphIndex > 0 || sourceGlyphIndex === 0) ? targetFont.glyphs.get(sourceGlyphIndex) : null;
-          } catch (e) {
-            sourceGlyph = null;
-          }
-          const scale = targetUnitsPerEm / (targetFont.unitsPerEm || 1000);
-          
-          let newGlyph = null;
-          if (!targetFont.precompiledCache) targetFont.precompiledCache = new Map();
-          if (sourceGlyphIndex > 0 && targetFont.precompiledCache.has(sourceGlyphIndex)) {
-            const cached = targetFont.precompiledCache.get(sourceGlyphIndex);
-            newGlyph = new opentype.Glyph({
-              name: cp === 0 ? '.null' : (sourceGlyph?.name || `uni${cp.toString(16).toUpperCase()}`),
-              unicode: cp,
-              advanceWidth: cached.advanceWidth,
-              path: new opentype.Path()
-            });
-            newGlyph._cachedMetrics = cached.metrics;
-            newGlyph._rawCharString = cached.rawCharString;
-          } else {
-            let scaledPath = new opentype.Path();
-            if (sourceGlyph) {
+          const isCaretCp = cp === 0x005E || cp === 0x02C6 || cp === 0x2038 || cp === 0x2041 || cp === 0x2303;
+          if (isCaretCp) {
+            const norm = normalizeCaretPath(scaledPath, advanceW, targetUnitsPerEm);
+            scaledPath = norm.path;
+            advanceW = norm.advanceWidth;
+          } else if (cp === 0x0640 && (!scaledPath || !scaledPath.commands || scaledPath.commands.length === 0)) {
+            const fixedTatweel = generateFixedTatweelGlyph(targetUnitsPerEm);
+            scaledPath = fixedTatweel.path;
+            advanceW = fixedTatweel.advanceWidth;
+          } else if (cp === 0x0338) {
+            const norm = normalizeCombiningOverlayPath(scaledPath, advanceW, targetUnitsPerEm);
+            scaledPath = norm.path;
+            advanceW = 0;
+          } else if (cp >= 0x1BC00 && cp <= 0x1BCA3 && (!scaledPath || !scaledPath.commands || scaledPath.commands.length === 0)) {
+            const fallbackFont = getDuployanFallbackFont();
+            if (fallbackFont) {
               try {
-                let p = null;
-                if (typeof sourceGlyph.getPath === 'function') {
-                  p = sourceGlyph.getPath();
-                } else if (typeof sourceGlyph.path === 'function') {
-                  p = sourceGlyph.path();
-                } else if (sourceGlyph.path) {
-                  p = sourceGlyph.path;
-                }
-                scaledPath = scalePath(p, scale, isCFF);
-              } catch (e) {
-                scaledPath = new opentype.Path();
-              }
-            }
-            let advanceW = 0;
-            try {
-              advanceW = sourceGlyph ? Math.round((sourceGlyph.advanceWidth || 0) * scale) : 0;
-            } catch (e) {}
-
-            const isCaretCp = cp === 0x005E || cp === 0x02C6 || cp === 0x2038 || cp === 0x2041 || cp === 0x2303;
-            if (isCaretCp) {
-              const norm = normalizeCaretPath(scaledPath, advanceW, targetUnitsPerEm);
-              scaledPath = norm.path;
-              advanceW = norm.advanceWidth;
-            } else if (cp === 0x0640 && (!scaledPath || !scaledPath.commands || scaledPath.commands.length === 0)) {
-              const fixedTatweel = generateFixedTatweelGlyph(targetUnitsPerEm);
-              scaledPath = fixedTatweel.path;
-              advanceW = fixedTatweel.advanceWidth;
-            } else if (cp === 0x0338) {
-              const norm = normalizeCombiningOverlayPath(scaledPath, advanceW, targetUnitsPerEm);
-              scaledPath = norm.path;
-              advanceW = 0;
-            } else if (cp >= 0x1BC00 && cp <= 0x1BCA3 && (!scaledPath || !scaledPath.commands || scaledPath.commands.length === 0)) {
-              const fallbackFont = getDuployanFallbackFont();
-              if (fallbackFont) {
-                try {
-                  const fg = fallbackFont.charToGlyph(String.fromCodePoint(cp));
-                  if (fg) {
-                    let fgPath = null;
-                    if (typeof fg.getPath === 'function') fgPath = fg.getPath();
-                    else if (typeof fg.path === 'function') fgPath = fg.path();
-                    else fgPath = fg.path;
-                    if (fgPath && fgPath.commands && fgPath.commands.length > 0) {
-                      const fScale = targetUnitsPerEm / (fallbackFont.unitsPerEm || 1000);
-                      scaledPath = scalePath(fgPath, fScale, isCFF);
-                      advanceW = Math.round((fg.advanceWidth || 0) * fScale);
-                    }
+                const fg = fallbackFont.charToGlyph(String.fromCodePoint(cp));
+                if (fg) {
+                  let fgPath = null;
+                  if (typeof fg.path === 'function') fgPath = fg.path();
+                  else if (fg.path) fgPath = fg.path;
+                  else if (typeof fg.getPath === 'function') fgPath = fg.getPath();
+                  if (fgPath && fgPath.commands && fgPath.commands.length > 0) {
+                    const fScale = targetUnitsPerEm / (fallbackFont.unitsPerEm || 1000);
+                    scaledPath = scalePath(fgPath, fScale, isCFF);
+                    advanceW = Math.round((fg.advanceWidth || 0) * fScale);
                   }
-                } catch (e) {}
-              }
+                }
+              } catch (e) {}
             }
-            const tempGlyph = new opentype.Glyph({
-              name: cp === 0 ? '.null' : (sourceGlyph?.name || `uni${cp.toString(16).toUpperCase()}`),
-              unicode: cp,
-              advanceWidth: advanceW,
-              path: scaledPath
-            });
-            let metrics = { xMin: 0, yMin: 0, xMax: 0, yMax: 0, leftSideBearing: 0, rightSideBearing: advanceW };
-            try {
-              metrics = tempGlyph.getMetrics();
-            } catch (e) {}
-            let rawCharString = null;
-            try {
-              const ops = opentype._glyphToOps(tempGlyph, 1);
-              rawCharString = opentype._encodeCHARSTRING(ops);
-            } catch (e) {}
-            
+          }
+          const tempGlyph = new opentype.Glyph({
+            name: cp === 0 ? '.null' : (sourceGlyph?.name || `uni${cp.toString(16).toUpperCase()}`),
+            unicode: cp,
+            advanceWidth: advanceW,
+            path: scaledPath
+          });
+          const { rawCharString, metrics } = fastEncodeCharStringAndMetrics(tempGlyph);
+          
+          if (sourceGlyphIndex > 0) {
             targetFont.precompiledCache.set(sourceGlyphIndex, {
               metrics,
               advanceWidth: tempGlyph.advanceWidth,
               rawCharString
             });
-            
-            newGlyph = tempGlyph;
-            newGlyph._cachedMetrics = metrics;
-            newGlyph._rawCharString = rawCharString;
-            newGlyph.path.commands = [];
           }
           
-          let replaceExisting = false;
-          if (baseGlyphIndex > 0) {
-              replaceExisting = true;
-          }
+          newGlyph = tempGlyph;
+          newGlyph._cachedMetrics = metrics;
+          newGlyph._rawCharString = rawCharString;
+          newGlyph.path.commands = [];
 
-          if (replaceExisting) {
-            let oldGlyph = null;
-            try {
-              oldGlyph = baseFontParsed.glyphs.get(baseGlyphIndex);
-            } catch (e) {}
-            let onlyUsedByCp = false;
-            if (!oldGlyph || !oldGlyph.unicodes || oldGlyph.unicodes.length <= 1) onlyUsedByCp = true;
-            
-            if (onlyUsedByCp) {
-              newGlyph.index = baseGlyphIndex;
-              baseFontParsed.glyphs.glyphs[baseGlyphIndex] = newGlyph;
-            } else {
-              if (oldGlyph && oldGlyph.unicodes) {
-                oldGlyph.unicodes = oldGlyph.unicodes.filter((u) => u !== cp);
-              }
-              if (oldGlyph && oldGlyph.unicode === cp) {
-                oldGlyph.unicode = oldGlyph.unicodes && oldGlyph.unicodes.length > 0 ? oldGlyph.unicodes[0] : undefined;
-              }
-              if (baseFontParsed.glyphs.length < 65535) {
-                newGlyph.index = baseFontParsed.glyphs.length;
-                baseFontParsed.glyphs.glyphs[baseFontParsed.glyphs.length] = newGlyph;
-                baseFontParsed.glyphs.length++;
-              } else {
-                hitLimit = true;
-              }
-            }
+          if (sourceGlyph && sourceGlyph.path && Array.isArray(sourceGlyph.path.commands)) {
+            sourceGlyph.path.commands = [];
+          }
+        }
+        
+        let replaceExisting = false;
+        if (baseGlyphIndex > 0) {
+          replaceExisting = true;
+        }
+
+        if (replaceExisting) {
+          let oldGlyph = null;
+          try {
+            oldGlyph = baseFontParsed.glyphs.get(baseGlyphIndex);
+          } catch (e) {}
+          let onlyUsedByCp = false;
+          if (!oldGlyph || !oldGlyph.unicodes || oldGlyph.unicodes.length <= 1) onlyUsedByCp = true;
+          
+          if (onlyUsedByCp) {
+            newGlyph.index = baseGlyphIndex;
+            baseFontParsed.glyphs.glyphs[baseGlyphIndex] = newGlyph;
           } else {
+            if (oldGlyph && oldGlyph.unicodes) {
+              oldGlyph.unicodes = oldGlyph.unicodes.filter((u) => u !== cp);
+            }
+            if (oldGlyph && oldGlyph.unicode === cp) {
+              oldGlyph.unicode = oldGlyph.unicodes && oldGlyph.unicodes.length > 0 ? oldGlyph.unicodes[0] : undefined;
+            }
             if (baseFontParsed.glyphs.length < 65535) {
               newGlyph.index = baseFontParsed.glyphs.length;
               baseFontParsed.glyphs.glyphs[baseFontParsed.glyphs.length] = newGlyph;
@@ -694,30 +1051,41 @@ try {
               hitLimit = true;
             }
           }
-          
-          processed++;
-          if (processed % 500 === 0) {
-            if (typeof global.gc === 'function') global.gc();
-            const mem = process.memoryUsage();
-            process.send({ type: 'progress', message: `Fused ${processed} / ${mappedCodepoints.size} (Mem: ${Math.round(mem.heapUsed/1024/1024)}MB)` });
+        } else {
+          if (baseFontParsed.glyphs.length < 65535) {
+            newGlyph.index = baseFontParsed.glyphs.length;
+            baseFontParsed.glyphs.glyphs[baseFontParsed.glyphs.length] = newGlyph;
+            baseFontParsed.glyphs.length++;
+          } else {
+            hitLimit = true;
           }
-        } catch (cpErr) {
-          console.warn(`[Worker] Error fusing codepoint U+${cp.toString(16).toUpperCase()}:`, cpErr.message);
-          missingCount++;
         }
-      } // End of cp loop
+        
+        processed++;
+        if (processed % 20 === 0 || processed >= mappedCodepoints.size) {
+          if (processed % 500 === 0 && typeof global.gc === 'function') {
+            const mem = process.memoryUsage();
+            if (mem.heapUsed > 750 * 1024 * 1024) global.gc();
+          }
+          const pct = Math.min(68, 15 + Math.round((processed / Math.max(1, mappedCodepoints.size)) * 53));
+          process.send({
+            type: 'progress',
+            percent: pct,
+            message: `Fused ${processed} / ${mappedCodepoints.size} glyphs (${Math.round((processed / Math.max(1, mappedCodepoints.size)) * 100)}%)`
+          });
+        }
+      } catch (cpErr) {
+        console.warn(`[Worker] Error fusing codepoint U+${cp.toString(16).toUpperCase()}:`, cpErr.message);
+        missingCount++;
+        processed++;
+      }
+    } // End of cp loop
     if (targetFont) targetFont.precompiledCache = null;
     parsedFontsCache.clear();
     if (typeof global.gc === 'function') global.gc();
   } // End of targetFontId loop
-  
-  
-    if (typeof global.gc === 'function') {
-        global.gc();
-        global.gc();
-    }
-    const memUsage = process.memoryUsage();
-    process.send({ type: 'progress', message: 'Generating final font buffer... (Mem: ' + Math.round(memUsage.heapUsed / 1024 / 1024) + 'MB / ' + Math.round(memUsage.heapTotal / 1024 / 1024) + 'MB)' });
+
+  process.send({ type: 'progress', percent: 69, message: 'Normalizing OpenType metrics and layout tables...' });
 
   
   // 1. Ensure Glyph 0 is strictly .notdef and unmapped in cmap
@@ -810,8 +1178,7 @@ try {
               g._cachedMetrics = null;
               g._rawCharString = null;
               try {
-                const ops = opentype._glyphToOps(g, 1);
-                g._rawCharString = opentype._encodeCHARSTRING(ops);
+                fastEncodeCharStringAndMetrics(g);
               } catch (e) {}
             }
           }
@@ -837,8 +1204,7 @@ try {
           g._cachedMetrics = null;
           g._rawCharString = null;
           try {
-            const ops = opentype._glyphToOps(g, 1);
-            g._rawCharString = opentype._encodeCHARSTRING(ops);
+            fastEncodeCharStringAndMetrics(g);
           } catch (e) {}
         }
       }
@@ -857,8 +1223,7 @@ try {
         path: fixedSolidus.path
       });
       try {
-        const ops = opentype._glyphToOps(g, 1);
-        g._rawCharString = opentype._encodeCHARSTRING(ops);
+        fastEncodeCharStringAndMetrics(g);
       } catch(e) {}
       if (baseFontParsed.glyphs.length < 65535) {
         g.index = baseFontParsed.glyphs.length;
@@ -878,8 +1243,7 @@ try {
         g._cachedMetrics = null;
         g._rawCharString = null;
         try {
-          const ops = opentype._glyphToOps(g, 1);
-          g._rawCharString = opentype._encodeCHARSTRING(ops);
+          fastEncodeCharStringAndMetrics(g);
         } catch (e) {}
       }
     }
@@ -925,8 +1289,7 @@ try {
               path: p
             });
             try {
-              const ops = opentype._glyphToOps(synthGlyph, 1);
-              synthGlyph._rawCharString = opentype._encodeCHARSTRING(ops);
+              fastEncodeCharStringAndMetrics(synthGlyph);
             } catch(e) {}
             if (baseFontParsed.glyphs.length < 65535) {
               synthGlyph.index = baseFontParsed.glyphs.length;
@@ -974,8 +1337,10 @@ try {
     }
   } catch (e) {}
 
-  // 4. Sanitize every glyph in baseFontParsed for strict CFF and Windows validation
-  for (let i = 0; i < baseFontParsed.glyphs.length; i++) {
+  // 4. Sanitize and pre-compile every glyph in baseFontParsed for strict CFF and Windows validation
+  const totalBaseGlyphs = baseFontParsed.glyphs.length;
+  const sanitizeStep = Math.max(50, Math.floor(totalBaseGlyphs / 50));
+  for (let i = 0; i < totalBaseGlyphs; i++) {
     let g = null;
     try {
       g = baseFontParsed.glyphs.get(i);
@@ -994,47 +1359,41 @@ try {
       }
     }
 
-    let glyphPath = null;
-    try {
-      if (typeof g.getPath === 'function') {
-        glyphPath = g.getPath();
-      } else if (typeof g.path === 'function') {
-        glyphPath = g.path();
-      } else if (g.path) {
-        glyphPath = g.path;
+    if (g.path && Array.isArray(g.path.commands) && g.path.commands.length > 0) {
+      for (const cmd of g.path.commands) {
+        if (!cmd) continue;
+        if (cmd.x !== undefined && (!isFinite(cmd.x) || isNaN(cmd.x))) cmd.x = 0;
+        if (cmd.y !== undefined && (!isFinite(cmd.y) || isNaN(cmd.y))) cmd.y = 0;
+        if (cmd.x1 !== undefined && (!isFinite(cmd.x1) || isNaN(cmd.x1))) cmd.x1 = 0;
+        if (cmd.y1 !== undefined && (!isFinite(cmd.y1) || isNaN(cmd.y1))) cmd.y1 = 0;
+        if (cmd.x2 !== undefined && (!isFinite(cmd.x2) || isNaN(cmd.x2))) cmd.x2 = 0;
+        if (cmd.y2 !== undefined && (!isFinite(cmd.y2) || isNaN(cmd.y2))) cmd.y2 = 0;
       }
-    } catch (e) {
-      glyphPath = new opentype.Path();
-    }
-    g.path = (glyphPath && Array.isArray(glyphPath.commands)) ? glyphPath : new opentype.Path();
-
-    let hasInvalidCoord = false;
-    for (const cmd of g.path.commands) {
-      if (!cmd) continue;
-      if (cmd.x !== undefined && (!isFinite(cmd.x) || isNaN(cmd.x))) { cmd.x = 0; hasInvalidCoord = true; }
-      if (cmd.y !== undefined && (!isFinite(cmd.y) || isNaN(cmd.y))) { cmd.y = 0; hasInvalidCoord = true; }
-      if (cmd.x1 !== undefined && (!isFinite(cmd.x1) || isNaN(cmd.x1))) { cmd.x1 = 0; hasInvalidCoord = true; }
-      if (cmd.y1 !== undefined && (!isFinite(cmd.y1) || isNaN(cmd.y1))) { cmd.y1 = 0; hasInvalidCoord = true; }
-      if (cmd.x2 !== undefined && (!isFinite(cmd.x2) || isNaN(cmd.x2))) { cmd.x2 = 0; hasInvalidCoord = true; }
-      if (cmd.y2 !== undefined && (!isFinite(cmd.y2) || isNaN(cmd.y2))) { cmd.y2 = 0; hasInvalidCoord = true; }
-    }
-    if (hasInvalidCoord) {
-      g._rawCharString = null;
     }
 
-    if (!g._rawCharString) {
+    // Precompile _rawCharString and _cachedMetrics now while glyf/loca is available so toArrayBuffer is instant and NEVER freezes
+    if (!g._rawCharString || !g._cachedMetrics) {
       try {
-        const ops = opentype._glyphToOps(g, 1);
-        g._rawCharString = opentype._encodeCHARSTRING(ops);
-      } catch (e) {
-        const emptyOps = [
-          { name: "width", type: "NUMBER", value: g.advanceWidth || 500 },
-          { name: "endchar", type: "OP", value: 14 }
-        ];
-        try {
-          g._rawCharString = opentype._encodeCHARSTRING(emptyOps);
-        } catch (e2) {}
+        fastEncodeCharStringAndMetrics(g);
+      } catch (err) {}
+    }
+    if (g.path && Array.isArray(g.path.commands) && g._rawCharString) {
+      g.path.commands = [];
+    }
+
+    if (i % sanitizeStep === 0 || i === totalBaseGlyphs - 1) {
+      if (i % 5000 === 0 && typeof global.gc === 'function') {
+        const mem = process.memoryUsage();
+        if (mem.heapUsed > 750 * 1024 * 1024) {
+          global.gc();
+        }
       }
+      const pct = 70 + Math.round((i / Math.max(1, totalBaseGlyphs)) * 25);
+      process.send({
+        type: 'progress',
+        percent: pct,
+        message: `Finalizing font outlines: ${i} / ${totalBaseGlyphs} glyphs (${Math.round((i / Math.max(1, totalBaseGlyphs)) * 100)}%)`
+      });
     }
   }
 
@@ -1101,40 +1460,71 @@ try {
     delete baseFontParsed.tables.loca;
   }
 
-  // COLOR UPDATE: Preserve and merge SVG in OpenType, COLR (COLRv0), CPAL, and CAPL font tables
+  // COLOR UPDATE: Preserve and merge SVG in OpenType, COLR (COLRv0), and CPAL font tables
   try {
-    let mergeColorTablesFn = null;
-    try {
-      mergeColorTablesFn = require('./src/lib/colorFontUtils.ts').mergeColorTables;
-    } catch (e1) {
+    function fontFileHasColor(fPath) {
+      if (!fPath || !fs.existsSync(fPath)) return false;
       try {
-        mergeColorTablesFn = require('./src/lib/colorFontUtils').mergeColorTables;
-      } catch (e2) {}
+        const fd = fs.openSync(fPath, 'r');
+        const headBuf = Buffer.alloc(1024);
+        const bytesRead = fs.readSync(fd, headBuf, 0, 1024, 0);
+        fs.closeSync(fd);
+        if (bytesRead < 12) return false;
+        const numTables = headBuf.readUInt16BE(4);
+        for (let ti = 0; ti < numTables && 12 + ti * 16 + 4 <= bytesRead; ti++) {
+          const tag = headBuf.toString('ascii', 12 + ti * 16, 12 + ti * 16 + 4);
+          if (tag === 'COLR' || tag === 'CPAL' || tag === 'SVG ') return true;
+        }
+      } catch (e) {}
+      return false;
     }
-    if (mergeColorTablesFn) {
-      const allGlyphsList = [];
-      if (baseFontParsed.glyphs && baseFontParsed.glyphs.length) {
-        for (let gi = 0; gi < baseFontParsed.glyphs.length; gi++) {
-          allGlyphsList.push(baseFontParsed.glyphs.get(gi));
-        }
+
+    const baseHasColor = (baseFontParsed.tables && (baseFontParsed.tables.colr || baseFontParsed.tables.COLR || baseFontParsed.tables.cpal || baseFontParsed.tables.CPAL || baseFontParsed.tables.svg || baseFontParsed.tables.SVG)) || (baseServerFilename ? fontFileHasColor(path.join(uploadDir, baseServerFilename)) : false);
+
+    const targetIdsWithColor = [];
+    const usedTargetIds = new Set(Object.values(glyphMap || {}));
+    for (const tId of usedTargetIds) {
+      const sfn = serverFontIds[tId];
+      if (sfn && fontFileHasColor(path.join(uploadDir, sfn))) {
+        targetIdsWithColor.push(tId);
       }
-      const colorTablesMerged = mergeColorTablesFn(baseFontParsed, parsedFontsCache, glyphMap, allGlyphsList);
-      if (colorTablesMerged && colorTablesMerged.hasColor) {
-        if (colorTablesMerged.cpalTable) {
-          baseFontParsed.tables.cpal = colorTablesMerged.cpalTable;
-          baseFontParsed.tables.capl = colorTablesMerged.caplTable;
-          baseFontParsed.tables.CPAL = colorTablesMerged.cpalTable;
-          baseFontParsed.tables.CAPL = colorTablesMerged.caplTable;
-        }
-        if (colorTablesMerged.colrTable) {
-          baseFontParsed.tables.colr = colorTablesMerged.colrTable;
-          baseFontParsed.tables.COLR = colorTablesMerged.colrTable;
-        }
-        if (colorTablesMerged.svgTable) {
-          baseFontParsed.tables.svg = colorTablesMerged.svgTable;
-          baseFontParsed.tables.SVG = colorTablesMerged.svgTable;
-        }
+    }
+
+    if (baseHasColor || targetIdsWithColor.length > 0) {
+      process.send({ type: 'progress', percent: 71, message: 'Processing color OpenType tables (COLR / CPAL / SVG)...' });
+      let mergeColorTablesFn = null;
+      try {
+        mergeColorTablesFn = require('./src/lib/colorFontUtils.ts').mergeColorTables;
+      } catch (e1) {
+        try {
+          mergeColorTablesFn = require('./src/lib/colorFontUtils').mergeColorTables;
+        } catch (e2) {}
       }
+      if (mergeColorTablesFn) {
+        const targetFontsForColor = new Map();
+        for (const tId of targetIdsWithColor) {
+          const tf = getTargetFont(tId);
+          if (tf) targetFontsForColor.set(tId, tf);
+        }
+        const colorTablesMerged = mergeColorTablesFn(baseFontParsed, targetFontsForColor, glyphMap);
+        if (colorTablesMerged && colorTablesMerged.hasColor) {
+          if (colorTablesMerged.cpalTable) {
+            baseFontParsed.tables.cpal = colorTablesMerged.cpalTable;
+            baseFontParsed.tables.CPAL = colorTablesMerged.cpalTable;
+          }
+          if (colorTablesMerged.colrTable) {
+            baseFontParsed.tables.colr = colorTablesMerged.colrTable;
+            baseFontParsed.tables.COLR = colorTablesMerged.colrTable;
+          }
+          if (colorTablesMerged.svgTable) {
+            baseFontParsed.tables.svg = colorTablesMerged.svgTable;
+            baseFontParsed.tables.SVG = colorTablesMerged.svgTable;
+          }
+        }
+        targetFontsForColor.clear();
+      }
+    } else {
+      process.send({ type: 'progress', percent: 71, message: 'Verified OpenType tables (standard monochrome outlines)...' });
     }
   } catch (e) {
     console.warn("Color table merge warning in worker:", e);
@@ -1154,12 +1544,15 @@ try {
     global.gc(); // Double sweep
   }
   
+  process.send({ type: 'progress', percent: 96, message: 'Generating final font buffer...' });
   const buffer = baseFontParsed.toArrayBuffer();
+  
+  process.send({ type: 'progress', percent: 99, message: 'Writing final font file to disk...' });
   const outputFilename = 'FusedFont_' + Date.now() + '.otf';
   const outputPath = path.join(uploadDir, outputFilename);
   fs.writeFileSync(outputPath, Buffer.from(buffer));
   
-  process.send({ type: 'done', file: outputPath, originalName: 'FusedFont.otf' });
+  process.send({ type: 'done', percent: 100, file: outputPath, originalName: 'FusedFont.otf' });
   setTimeout(() => process.exit(0), 100);
   
 } catch (err) {

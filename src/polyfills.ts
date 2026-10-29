@@ -1,4 +1,9 @@
 import { Buffer } from 'buffer';
+import { injectApplyPolyfill } from './lib/applyPolyfill';
+import './lib/dataViewPolyfill';
+
+// Auto-inject apply polyfill globally on both browser and server
+injectApplyPolyfill();
 
 if (typeof window !== 'undefined') {
   (window as any).global = window;

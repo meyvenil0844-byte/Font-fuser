@@ -57,17 +57,10 @@ export class ErrorBoundary extends Component<Props, State> {
               <RefreshCw className="w-3.5 h-3.5" /> Reload View
             </button>
             <button
-              onClick={async () => {
-                try {
-                  const { clear } = await import('idb-keyval');
-                  await clear();
-                  if (typeof localStorage !== 'undefined') localStorage.clear();
-                } catch {}
-                window.location.reload();
-              }}
-              className="flex items-center gap-2 px-4 py-2 bg-red-950/40 hover:bg-red-900/50 border border-red-500/30 text-red-300 rounded text-xs font-bold uppercase tracking-wider transition-colors"
+              onClick={() => window.location.reload()}
+              className="flex items-center gap-2 px-4 py-2 bg-white/10 hover:bg-white/20 border border-white/20 text-gray-200 rounded text-xs font-bold uppercase tracking-wider transition-colors"
             >
-              Reset Cache & Reload
+              Refresh Browser
             </button>
           </div>
         </div>
